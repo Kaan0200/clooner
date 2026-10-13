@@ -2,6 +2,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { exists, mkdir, readDir, readTextFile, stat, writeTextFile } from "@tauri-apps/plugin-fs";
 import { isAudioFile } from "@/core/audio";
 import { cloneFolders, isInside, leafFolders, normalizeRoot } from "@/core/clone";
+import type { SyncedEntry } from "@/core/sync";
 
 export interface ScanResult {
   tracks: number;
@@ -10,6 +11,8 @@ export interface ScanResult {
 }
 
 export interface CloneResult {
+  /** The clone's id from its `clooner.json`. */
+  id: string;
   /** True when the folder was already a clooner clone and has been re-attached. */
   existing: boolean;
   /** Folders now present in the clone, including any created on this pass. */
@@ -19,7 +22,7 @@ export interface CloneResult {
 }
 
 /** The `clooner.json` marker at the root of a clone. */
-interface CloneDb {
+export interface CloneDb {
   version: number;
   kind: "clone";
   id: string;
@@ -27,6 +30,19 @@ interface CloneDb {
   source: { path: string };
   /** When the clone was last opened by the app, as ISO 8601. */
   attached?: string;
+  /** When the clone was last synced, as ISO 8601. */
+  lastSync?: string;
+  /** The source state of each copied track, keyed by its source-relative path. */
+  synced?: Record<string, SyncedEntry>;
+}
+
+/** The marker file's path for a clone root. */
+export function cloneMarker(cloneRoot: string): string {
+  return `${normalizeRoot(cloneRoot)}/clooner.json`;
+}
+
+export async function writeCloneDb(cloneRoot: string, db: CloneDb): Promise<void> {
+  await writeTextFile(cloneMarker(cloneRoot), JSON.stringify(db, null, 2) + "\n");
 }
 
 /** Opens the OS folder picker. Resolves to null when the user cancels. */
@@ -116,7 +132,7 @@ export async function attachClone(
       };
   await writeTextFile(marker, JSON.stringify(db, null, 2) + "\n");
 
-  return { existing: previous !== null, folders: scan.folders.length + 2, tracks };
+  return { id: db.id, existing: previous !== null, folders: scan.folders.length + 2, tracks };
 }
 
 /**
@@ -124,7 +140,7 @@ export async function attachClone(
  * the file exists but isn't a clooner clone, so an unrelated `clooner.json`
  * is never overwritten.
  */
-async function readCloneDb(marker: string): Promise<CloneDb | null> {
+export async function readCloneDb(marker: string): Promise<CloneDb | null> {
   if (!(await exists(marker))) return null;
 
   let parsed: unknown;
@@ -187,7 +203,7 @@ function baseName(path: string): string {
   return path.slice(Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\")) + 1);
 }
 
-async function forEachConcurrent<T>(
+export async function forEachConcurrent<T>(
   items: T[],
   limit: number,
   fn: (item: T) => Promise<void>,

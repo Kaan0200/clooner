@@ -1,4 +1,25 @@
-import { encodePath } from "./names";
+import { encodeName, encodePath } from "./names";
+
+/**
+ * Where a source track lives inside a clone: the same path relative to the
+ * root, under `Tracks/`, with names encoded. Null when the track isn't under
+ * the source root at all.
+ */
+export function cloneTrackPath(sourceRoot: string, cloneRoot: string, track: string): string | null {
+  const root = normalizeRoot(sourceRoot);
+  const path = normalizeRoot(track);
+  if (!isInside(root, path) || path.length === root.length) return null;
+  const relative = path.slice(root.length + 1);
+  return `${normalizeRoot(cloneRoot)}/Tracks/${encodePath(relative)}`;
+}
+
+/**
+ * The folder that holds a crate's playlists inside a clone: `Crates/` then
+ * one encoded folder per level of the crate's path, outermost first.
+ */
+export function cloneCrateFolder(cloneRoot: string, crateNames: string[]): string {
+  return [normalizeRoot(cloneRoot), "Crates", ...crateNames.map(encodeName)].join("/");
+}
 
 /** Normalize an absolute path for comparison: forward slashes, no trailing slash. */
 export function normalizeRoot(path: string): string {

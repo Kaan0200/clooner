@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type { PhysicalPosition } from "@tauri-apps/api/dpi";
-import { ChevronRight, Folder, FolderOpen, Music, Plus } from "lucide-react";
+import { ChevronRight, Folder, FolderOpen, ListMusic, Music, Plus } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
@@ -11,14 +11,15 @@ import {
   findCrate,
   renameCrate,
   visibleRows,
-  type CrateTree,
+  type CrateNode,
   type TreeRow,
 } from "@/core/tree";
 import { collectAudioFiles } from "@/lib/library";
+import { openCratePlaylist } from "@/lib/playlist";
+import type { Library } from "@/lib/useLibrary";
 
 interface Props {
-  tree: CrateTree;
-  onChange: (tree: CrateTree) => void;
+  library: Library;
 }
 
 const INDENT_PX = 16;
@@ -26,9 +27,13 @@ const INDENT_PX = 16;
 /**
  * The crate tree. Add creates a collection when nothing is selected, or a
  * subcrate under the selected crate. A new crate opens in rename mode.
- * Dragging files from the OS onto a row adds them to that crate.
+ * Dragging files from the OS onto a row adds them to that crate, and each
+ * row's buttons act on that crate.
  */
-export default function CratesScreen({ tree, onChange }: Props) {
+export default function CratesScreen({ library }: Props) {
+  const tree = library.crates;
+  const onChange = library.setCrates;
+
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set());
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -40,6 +45,16 @@ export default function CratesScreen({ tree, onChange }: Props) {
   // A selection can go stale if the tree changes underneath it.
   const selected = selectedId ? findCrate(tree, selectedId) : undefined;
   const rows = visibleRows(tree, expanded);
+
+  // Playlists are written into the first clone that is connected right now.
+  const playlistClone = library.clones.find(
+    (c) => library.cloneStatus[c.path]?.kind === "ready",
+  );
+  const playlistBlocker = !library.source
+    ? "Add a source library first"
+    : !playlistClone
+      ? "No clone is connected"
+      : null;
 
   useEffect(() => {
     if (!selectedId) return;
@@ -117,6 +132,28 @@ export default function CratesScreen({ tree, onChange }: Props) {
         (skipped > 0 ? `, ${skipped} already there` : ""),
     );
     setSelectedId(crateId);
+  }
+
+  async function openPlaylist(crate: CrateNode) {
+    if (!library.source || !playlistClone) return;
+    const names = [...(ancestorsOf(tree, crate.id) ?? []), crate].map((n) => n.name);
+    setSelectedId(crate.id);
+    setNotice(`Opening "${crate.name}" as a playlist…`);
+    try {
+      const result = await openCratePlaylist({
+        crateNames: names,
+        tracks: crate.tracks,
+        sourceRoot: library.source.path,
+        cloneRoot: playlistClone.path,
+      });
+      const outside =
+        result.outsideLibrary > 0
+          ? `, ${plural(result.outsideLibrary, "track")} outside the library listed as-is`
+          : "";
+      setNotice(`Opened ${result.file}${outside}`);
+    } catch (e) {
+      setNotice(`Couldn't open the playlist: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 
   function setExpandedFor(id: string, open: boolean) {
@@ -251,11 +288,19 @@ export default function CratesScreen({ tree, onChange }: Props) {
                 editing={row.node.id === editingId}
                 dropTarget={row.node.id === dropTargetId}
                 dragging={dragging}
+                playlistTitle={
+                  playlistBlocker ??
+                  (row.node.tracks.length === 0
+                    ? "This crate has no tracks yet"
+                    : `Open as a playlist from ${playlistClone!.path}`)
+                }
+                playlistEnabled={playlistBlocker === null && row.node.tracks.length > 0}
                 onSelect={() => select(row.node.id)}
                 onToggle={() => setExpandedFor(row.node.id, !expanded.has(row.node.id))}
                 onEdit={() => setEditingId(row.node.id)}
                 onCommit={(name) => commitRename(row.node.id, name)}
                 onCancel={cancelRename}
+                onOpenPlaylist={() => void openPlaylist(row.node)}
               />
             ))}
             {/* Fills the rest of the panel so clicks below the last row deselect. */}
@@ -271,7 +316,7 @@ export default function CratesScreen({ tree, onChange }: Props) {
               [...(ancestorsOf(tree, selected.id) ?? []), selected].map((n) => n.name).join(" / ")}
           </span>
           {notice && (
-            <span role="status" className="shrink-0 truncate text-foreground">
+            <span role="status" className="min-w-0 truncate text-foreground" title={notice}>
               {notice}
             </span>
           )}
@@ -304,11 +349,15 @@ interface RowProps {
   dropTarget: boolean;
   /** Files are being dragged somewhere over the window. */
   dragging: boolean;
+  /** Tooltip for the playlist button: what it does, or why it is disabled. */
+  playlistTitle: string;
+  playlistEnabled: boolean;
   onSelect: () => void;
   onToggle: () => void;
   onEdit: () => void;
   onCommit: (name: string) => string | null;
   onCancel: () => void;
+  onOpenPlaylist: () => void;
 }
 
 function CrateRow({
@@ -318,11 +367,14 @@ function CrateRow({
   editing,
   dropTarget,
   dragging,
+  playlistTitle,
+  playlistEnabled,
   onSelect,
   onToggle,
   onEdit,
   onCommit,
   onCancel,
+  onOpenPlaylist,
 }: RowProps) {
   const { node, depth } = row;
   const hasChildren = node.children.length > 0;
@@ -349,7 +401,7 @@ function CrateRow({
       aria-expanded={hasChildren ? expanded : undefined}
       data-crate-id={node.id}
       data-drop-target={dropTarget || undefined}
-      className={`flex h-8 cursor-default items-center gap-1 rounded-md pr-2 text-sm transition-colors select-none ${background}`}
+      className={`group/row flex h-8 cursor-default items-center gap-1 rounded-md pr-1 text-sm transition-colors select-none ${background}`}
       style={{ paddingLeft: 4 + depth * INDENT_PX }}
       onClick={onSelect}
       onDoubleClick={onEdit}
@@ -379,18 +431,41 @@ function CrateRow({
       ) : (
         <span className="truncate">{node.name}</span>
       )}
+
       {dropTarget ? (
-        <span className="ml-auto shrink-0 text-xs font-medium text-primary">Drop to add</span>
+        <span className="ml-auto shrink-0 pr-1 text-xs font-medium text-primary">Drop to add</span>
       ) : (
-        node.tracks.length > 0 && (
+        <span className="ml-auto flex shrink-0 items-center gap-1">
+          {node.tracks.length > 0 && (
+            <span
+              className="flex items-center gap-1 pr-1 text-xs text-muted-foreground"
+              title={plural(node.tracks.length, "track")}
+            >
+              <Music className="size-3" />
+              {node.tracks.length.toLocaleString()}
+            </span>
+          )}
+          {/* Row actions: shown on hover or when the row is selected. */}
           <span
-            className="ml-auto flex shrink-0 items-center gap-1 text-xs text-muted-foreground"
-            title={plural(node.tracks.length, "track")}
+            className={`flex items-center gap-0.5 transition-opacity group-hover/row:opacity-100 ${
+              selected ? "opacity-100" : "opacity-0"
+            }`}
+            onClick={(e) => e.stopPropagation()}
+            onDoubleClick={(e) => e.stopPropagation()}
           >
-            <Music className="size-3" />
-            {node.tracks.length.toLocaleString()}
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              tabIndex={-1}
+              aria-label="Open as playlist"
+              title={playlistTitle}
+              disabled={!playlistEnabled}
+              onClick={onOpenPlaylist}
+            >
+              <ListMusic />
+            </Button>
           </span>
-        )
+        </span>
       )}
     </div>
   );
