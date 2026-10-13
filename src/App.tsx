@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { FolderTree, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import type { CrateTree } from "@/core/tree";
 import CratesScreen from "@/screens/CratesScreen";
 import SyncScreen from "@/screens/SyncScreen";
 
@@ -8,6 +9,8 @@ type View = "crates" | "sync" | "settings";
 
 export default function App() {
   const [view, setView] = useState<View>("crates");
+  // Held here so the tree survives switching views. Not saved to disk yet.
+  const [crates, setCrates] = useState<CrateTree>([]);
 
   return (
     <div className="flex h-screen flex-col bg-background text-foreground">
@@ -37,7 +40,7 @@ export default function App() {
         </Button>
       </header>
 
-      {view === "crates" && <CratesScreen />}
+      {view === "crates" && <CratesScreen tree={crates} onChange={setCrates} />}
       {view === "sync" && <SyncScreen />}
     </div>
   );

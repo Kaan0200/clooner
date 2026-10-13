@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { HardDrive, Plus, Usb } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { createClone, pickFolder, scanLibrary, type ScanResult } from "@/lib/library";
+import { attachClone, pickFolder, scanLibrary, type CloneResult, type ScanResult } from "@/lib/library";
 
 interface SourceLocation {
   path: string;
@@ -10,7 +10,8 @@ interface SourceLocation {
 
 interface CloneLocation {
   path: string;
-  foldersCreated: number | null;
+  /** Null while the clone is still being set up. */
+  result: CloneResult | null;
   progress: string;
 }
 
@@ -39,19 +40,21 @@ export default function SyncScreen() {
   async function addClone() {
     if (!source?.scan) return;
     setError(null);
-    const path = await pickFolder("Choose an empty folder for the clone");
+    const path = await pickFolder("Choose a folder for the clone (empty, or an existing clone)");
     if (!path) return;
+    if (clones.some((c) => c.path === path)) {
+      setError("That clone is already in the list.");
+      return;
+    }
 
     setBusy(true);
-    setClones((cs) => [...cs, { path, foldersCreated: null, progress: "Creating folders…" }]);
+    setClones((cs) => [...cs, { path, result: null, progress: "Creating folders…" }]);
     try {
-      const result = await createClone(source.path, path, source.scan, (done, total) => {
+      const result = await attachClone(source.path, path, source.scan, (done, total) => {
         const progress = `Creating folders… ${done.toLocaleString()} / ${total.toLocaleString()}`;
         setClones((cs) => cs.map((c) => (c.path === path ? { ...c, progress } : c)));
       });
-      setClones((cs) =>
-        cs.map((c) => (c.path === path ? { ...c, foldersCreated: result.foldersCreated } : c)),
-      );
+      setClones((cs) => cs.map((c) => (c.path === path ? { ...c, result } : c)));
     } catch (e) {
       setClones((cs) => cs.filter((c) => c.path !== path));
       setError(e instanceof Error ? e.message : String(e));
@@ -94,9 +97,7 @@ export default function SyncScreen() {
 
         {clones.map((clone) => (
           <LocationCard key={clone.path} icon={Usb} kind="Clone" path={clone.path}>
-            {clone.foldersCreated === null
-              ? clone.progress
-              : `${clone.foldersCreated.toLocaleString()} folders created, no tracks yet`}
+            {clone.result === null ? clone.progress : describeClone(clone.result)}
           </LocationCard>
         ))}
 
@@ -104,6 +105,13 @@ export default function SyncScreen() {
       </div>
     </div>
   );
+}
+
+function describeClone({ existing, folders, tracks }: CloneResult): string {
+  const folderText = `${folders.toLocaleString()} folders`;
+  if (!existing) return `${folderText} created, no tracks yet`;
+  const trackText = tracks === 0 ? "no tracks" : `${tracks.toLocaleString()} tracks`;
+  return `Existing clone, ${trackText} in ${folderText}, ready to sync`;
 }
 
 function LocationCard({
