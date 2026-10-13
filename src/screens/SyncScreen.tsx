@@ -2,7 +2,7 @@ import { FolderSync, HardDrive, Plus, RefreshCw, Usb, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import type { CloneEntry } from "@/core/db";
 import type { CloneResult } from "@/lib/library";
-import type { SyncSummary } from "@/lib/sync";
+import type { CopySummary, SyncSummary } from "@/lib/sync";
 import type { CloneStatus, Library, SourceStatus } from "@/lib/useLibrary";
 
 export default function SyncScreen({ library }: { library: Library }) {
@@ -83,7 +83,7 @@ export default function SyncScreen({ library }: { library: Library }) {
                     size="icon-sm"
                     aria-label="Forget this clone"
                     title="Forget this location (files on disk are kept)"
-                    disabled={status?.kind === "syncing"}
+                    disabled={status?.kind === "working"}
                     onClick={() => library.removeClone(clone.path)}
                   >
                     <X />
@@ -107,9 +107,9 @@ function syncTitle(sourceReady: boolean, status: CloneStatus | undefined): strin
   if (!sourceReady) return "The source must be connected to sync";
   switch (status?.kind) {
     case "ready":
-      return "Copy every crate's tracks here and write its Serato crates and playlists";
-    case "syncing":
-      return "Sync in progress";
+      return "Copy newer files both ways, then write the crates into this clone's _Serato_ folder";
+    case "working":
+      return "Busy";
     case "missing":
       return "The clone isn't connected";
     default:
@@ -135,9 +135,10 @@ function describeSource(status: SourceStatus | null): string {
 function describeClone(clone: CloneEntry, status: CloneStatus | undefined): string {
   switch (status?.kind) {
     case "ready":
-      return status.summary ? describeSummary(status.summary) : describeAttached(clone, status.result);
-    case "syncing":
-      return status.progress;
+      if (status.lastSync) return describeSync(status.lastSync);
+      if (status.lastCopy) return describeCopy(status.lastCopy);
+      return describeAttached(clone, status.result);
+    case "working":
     case "attaching":
       return status.progress;
     case "missing":
@@ -157,13 +158,23 @@ function describeAttached(clone: CloneEntry, { existing, folders, tracks }: Clon
   return `${trackText} in ${folderText}, ${when}`;
 }
 
-function describeSummary(s: SyncSummary): string {
-  const parts = [`${s.copied.toLocaleString()} copied`, `${s.unchanged.toLocaleString()} unchanged`];
+function describeSync(s: SyncSummary): string {
+  const parts = [`${s.crates.toLocaleString()} crates written`];
+  if (s.toClone) parts.push(`${s.toClone.toLocaleString()} copied to clone`);
+  if (s.toSource) parts.push(`${s.toSource.toLocaleString()} copied back to source`);
+  if (s.unchanged) parts.push(`${s.unchanged.toLocaleString()} unchanged`);
+  if (s.bothChanged) parts.push(`${s.bothChanged.toLocaleString()} changed on both sides, newer kept`);
+  if (s.missing) parts.push(`${s.missing.toLocaleString()} missing everywhere`);
+  if (s.outside) parts.push(`${s.outside.toLocaleString()} outside the library left out`);
+  return `Synced ${relativeTime(s.finished)}: ${parts.join(", ")}`;
+}
+
+function describeCopy(s: CopySummary): string {
+  const parts = [`${s.copied.toLocaleString()} copied`];
+  if (s.unchanged) parts.push(`${s.unchanged.toLocaleString()} already here`);
   if (s.missing) parts.push(`${s.missing.toLocaleString()} missing from source`);
   if (s.outside) parts.push(`${s.outside.toLocaleString()} outside the library`);
-  parts.push(`${s.crates.toLocaleString()} crates written`);
-  if (s.orphans) parts.push(`${s.orphans.toLocaleString()} files in no crate`);
-  return `Synced ${relativeTime(s.finished)}: ${parts.join(", ")}`;
+  return `Tracks ${relativeTime(s.finished)}: ${parts.join(", ")}. Press Sync to write the crates.`;
 }
 
 function relativeTime(iso: string): string {

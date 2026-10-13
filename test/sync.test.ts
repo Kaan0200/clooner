@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  decideSync,
   needsCopy,
-  planSync,
+  planCrates,
+  planTracks,
+  sameFile,
   seratoCrateFile,
   volumeRelative,
   volumeRoot,
@@ -17,7 +20,7 @@ const crates: CrateTree = [
       {
         id: "deep",
         name: "Deep/House",
-        tracks: ["c:\\music\\club\\one.mp3", "C:/Music/House/Deep/Three.flac"],
+        tracks: ["C:/Music/Club/One.mp3", "C:/Music/House/Deep/Three.flac"],
         children: [],
       },
     ],
@@ -25,56 +28,110 @@ const crates: CrateTree = [
   { id: "empty", name: "Empty", tracks: [], children: [] },
 ];
 
-describe("planSync", () => {
-  const plan = planSync("C:\\Music", "E:\\", crates);
-
-  it("copies each track once even when it is in several crates", () => {
-    expect(plan.tracks.map((t) => t.relative)).toEqual(["Club/One.mp3", "House/Deep/Three.flac"]);
-    expect(plan.tracks[0].clonePath).toBe("E:/Tracks/Club/One.mp3");
-    expect(plan.tracks[0].source).toBe("C:/Music/Club/One.mp3");
-  });
-
-  it("lists every crate with its path of names, and shares track jobs", () => {
-    expect(plan.crates.map((c) => c.names)).toEqual([["Club"], ["Club", "Deep/House"], ["Empty"]]);
-    expect(plan.crates[1].tracks[0]).toBe(plan.tracks[0]);
-    expect(plan.crates[2].tracks).toEqual([]);
+describe("planTracks", () => {
+  it("maps tracks into the clone once each, keeping the first spelling", () => {
+    const plan = planTracks("C:\\Music", "E:\\", [
+      "C:/Music/Club/One.mp3",
+      "c:\\music\\club\\one.mp3",
+      "C:/Music/House/Deep/Three.flac",
+    ]);
+    expect(plan.tracks).toEqual([
+      { source: "C:/Music/Club/One.mp3", relative: "Club/One.mp3", clonePath: "E:/Tracks/Club/One.mp3" },
+      {
+        source: "C:/Music/House/Deep/Three.flac",
+        relative: "House/Deep/Three.flac",
+        clonePath: "E:/Tracks/House/Deep/Three.flac",
+      },
+    ]);
+    expect(plan.outside).toEqual([]);
   });
 
   it("sets aside tracks outside the source library", () => {
+    const plan = planTracks("C:/Music", "E:/", ["D:/Elsewhere/Two.mp3", "C:/Music/x.mp3"]);
     expect(plan.outside).toEqual(["D:/Elsewhere/Two.mp3"]);
-    expect(plan.crates[0].outside).toEqual(["D:/Elsewhere/Two.mp3"]);
-    expect(plan.crates[0].tracks).toHaveLength(1);
-  });
-
-  it("names a stub per track inside the crate's encoded folder", () => {
-    expect(plan.crates[1].stubs.map((s) => s.file)).toEqual([
-      "E:/Crates/Club/Deep／House/One.m3u",
-      "E:/Crates/Club/Deep／House/Three.m3u",
-    ]);
-  });
-
-  it("numbers stubs whose tracks share a file name", () => {
-    const twins: CrateTree = [
-      { id: "a", name: "A", children: [], tracks: ["C:/Music/x/Same.mp3", "C:/Music/y/Same.mp3"] },
-    ];
-    const files = planSync("C:/Music", "E:/", twins).crates[0].stubs.map((s) => s.file);
-    expect(files).toEqual(["E:/Crates/A/Same.m3u", "E:/Crates/A/Same (2).m3u"]);
+    expect(plan.tracks.map((t) => t.relative)).toEqual(["x.mp3"]);
   });
 });
 
-describe("needsCopy", () => {
-  const state = { size: 10, mtime: 1000 };
+describe("planCrates", () => {
+  const jobs = planCrates("C:\\Music", "E:\\", crates);
 
+  it("lists every crate with its path of names", () => {
+    expect(jobs.map((c) => c.names)).toEqual([["Club"], ["Club", "Deep/House"], ["Empty"]]);
+  });
+
+  it("gives each crate its member tracks' places in the clone", () => {
+    expect(jobs[0].tracks.map((t) => t.clonePath)).toEqual(["E:/Tracks/Club/One.mp3"]);
+    expect(jobs[0].outside).toEqual(["D:/Elsewhere/Two.mp3"]);
+    expect(jobs[1].tracks.map((t) => t.clonePath)).toEqual([
+      "E:/Tracks/Club/One.mp3",
+      "E:/Tracks/House/Deep/Three.flac",
+    ]);
+    expect(jobs[2].tracks).toEqual([]);
+  });
+});
+
+const state = { size: 10, mtime: 100_000 };
+const record = { source: state, clone: state };
+
+describe("needsCopy", () => {
   it("copies when the clone lacks the file or nothing was recorded", () => {
-    expect(needsCopy(state, state, false)).toBe(true);
+    expect(needsCopy(record, state, false)).toBe(true);
     expect(needsCopy(undefined, state, true)).toBe(true);
   });
 
   it("copies only when the recorded source state differs", () => {
-    expect(needsCopy(state, { size: 10, mtime: 1000 }, true)).toBe(false);
-    expect(needsCopy(state, { size: 11, mtime: 1000 }, true)).toBe(true);
-    expect(needsCopy(state, { size: 10, mtime: 2000 }, true)).toBe(true);
-    expect(needsCopy({ size: 10, mtime: null }, { size: 10, mtime: null }, true)).toBe(false);
+    expect(needsCopy(record, { size: 10, mtime: 100_000 }, true)).toBe(false);
+    expect(needsCopy(record, { size: 11, mtime: 100_000 }, true)).toBe(true);
+    expect(needsCopy(record, { size: 10, mtime: 200_000 }, true)).toBe(true);
+    const noTime = { size: 10, mtime: null };
+    expect(needsCopy({ source: noTime, clone: noTime }, noTime, true)).toBe(false);
+  });
+});
+
+describe("sameFile", () => {
+  it("tolerates the two-second timestamps of FAT drives", () => {
+    expect(sameFile(state, { size: 10, mtime: 101_999 })).toBe(true);
+    expect(sameFile(state, { size: 10, mtime: 102_001 })).toBe(false);
+    expect(sameFile(state, { size: 9, mtime: 100_000 })).toBe(false);
+    expect(sameFile(state, { size: 10, mtime: null })).toBe(false);
+  });
+});
+
+describe("decideSync", () => {
+  const later = { size: 12, mtime: 500_000 };
+  const other = { size: 13, mtime: 300_000 };
+
+  it("fills in whichever side is missing", () => {
+    expect(decideSync(record, state, null).direction).toBe("toClone");
+    expect(decideSync(record, null, state).direction).toBe("toSource");
+    expect(decideSync(undefined, null, null).direction).toBe("missing");
+  });
+
+  it("with a record, copies only the side that changed", () => {
+    expect(decideSync(record, state, state)).toEqual({ direction: "none", bothChanged: false });
+    expect(decideSync(record, later, state)).toEqual({ direction: "toClone", bothChanged: false });
+    expect(decideSync(record, state, later)).toEqual({ direction: "toSource", bothChanged: false });
+  });
+
+  it("when both changed, the newer file wins and the clash is flagged", () => {
+    expect(decideSync(record, other, later)).toEqual({ direction: "toSource", bothChanged: true });
+    expect(decideSync(record, later, other)).toEqual({ direction: "toClone", bothChanged: true });
+  });
+
+  it("without a record, identical files stay put and otherwise the newer wins", () => {
+    expect(decideSync(undefined, state, { ...state }).direction).toBe("none");
+    expect(decideSync(undefined, state, later).direction).toBe("toSource");
+    expect(decideSync(undefined, later, state).direction).toBe("toClone");
+  });
+
+  it("lets the source win ties and unknown timestamps", () => {
+    expect(decideSync(undefined, { size: 1, mtime: 100_000 }, { size: 2, mtime: 101_000 }).direction).toBe(
+      "toClone",
+    );
+    expect(decideSync(undefined, { size: 1, mtime: null }, { size: 2, mtime: 9 }).direction).toBe(
+      "toClone",
+    );
   });
 });
 

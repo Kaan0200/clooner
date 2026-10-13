@@ -5,12 +5,20 @@ import {
   ancestorsOf,
   crateNameError,
   findCrate,
+  hasContents,
+  isWithin,
+  moveCrate,
+  moveTrack,
   removeCrate,
+  removeTrack,
   renameCrate,
+  rowCrateId,
+  rowKey,
   siblingsOf,
   uniqueName,
   visibleRows,
   type CrateTree,
+  type TreeRow,
 } from "../src/core/tree";
 
 const sample: CrateTree = [
@@ -143,6 +151,66 @@ describe("addTracks", () => {
   });
 });
 
+describe("removeTrack and moveTrack", () => {
+  it("removes a track regardless of case and separators, and ignores unknowns", () => {
+    expect(findCrate(removeTrack(sample, "club-house", "c:\\music\\house\\ONE.mp3"), "club-house")?.tracks).toEqual([]);
+    expect(removeTrack(sample, "club-house", "C:/Music/House/none.mp3")).toBe(sample);
+    expect(removeTrack(sample, "nope", "x.mp3")).toBe(sample);
+  });
+
+  it("moves a track between crates", () => {
+    const tree = moveTrack(sample, "club-house", "C:/Music/House/one.mp3", "deep");
+    expect(findCrate(tree, "club-house")?.tracks).toEqual([]);
+    expect(findCrate(tree, "deep")?.tracks).toEqual(["C:/Music/House/one.mp3"]);
+  });
+
+  it("can keep the track in the original crate", () => {
+    const tree = moveTrack(sample, "club-house", "C:/Music/House/one.mp3", "weddings", true);
+    expect(findCrate(tree, "club-house")?.tracks).toEqual(["C:/Music/House/one.mp3"]);
+    expect(findCrate(tree, "weddings")?.tracks).toEqual(["C:/Music/House/one.mp3"]);
+  });
+
+  it("does nothing within the same crate and rejects missing crates", () => {
+    expect(moveTrack(sample, "club-house", "C:/Music/House/one.mp3", "club-house")).toBe(sample);
+    expect(() => moveTrack(sample, "nope", "x.mp3", "deep")).toThrow(/not found/);
+    expect(() => moveTrack(sample, "club-house", "x.mp3", "nope")).toThrow(/not found/);
+  });
+});
+
+describe("isWithin and moveCrate", () => {
+  it("knows a crate's subtree", () => {
+    expect(isWithin(sample, "club", "deep")).toBe(true);
+    expect(isWithin(sample, "club", "club")).toBe(true);
+    expect(isWithin(sample, "deep", "club")).toBe(false);
+    expect(isWithin(sample, "weddings", "deep")).toBe(false);
+  });
+
+  it("moves a crate with its subtree under another crate", () => {
+    const tree = moveCrate(sample, "club-house", "weddings");
+    expect(findCrate(tree, "club")?.children.map((c) => c.id)).toEqual(["club-2024"]);
+    expect(findCrate(tree, "weddings")?.children.map((c) => c.id)).toEqual(["club-house"]);
+    expect(findCrate(tree, "deep")).toBeDefined();
+  });
+
+  it("moves a crate to the top level", () => {
+    const tree = moveCrate(sample, "deep", null);
+    expect(tree.map((c) => c.id)).toEqual(["club", "weddings", "deep"]);
+    expect(findCrate(tree, "club-house")?.children).toEqual([]);
+  });
+
+  it("refuses to nest a crate inside itself or its subtree", () => {
+    expect(() => moveCrate(sample, "club", "club")).toThrow(/inside itself/);
+    expect(() => moveCrate(sample, "club", "deep")).toThrow(/inside itself/);
+  });
+
+  it("refuses a name clash and leaves a crate where it already is", () => {
+    const clash = addCrate(sample, "weddings", "House").tree;
+    expect(() => moveCrate(clash, "club-house", "weddings")).toThrow(/already a crate/);
+    expect(moveCrate(sample, "deep", "club-house")).toBe(sample);
+    expect(() => moveCrate(sample, "nope", null)).toThrow(/not found/);
+  });
+});
+
 describe("removeCrate", () => {
   it("removes a nested crate and its subtree", () => {
     const tree = removeCrate(sample, "club-house");
@@ -173,26 +241,36 @@ describe("ancestorsOf and siblingsOf", () => {
 });
 
 describe("visibleRows", () => {
+  const describeRow = (r: TreeRow) =>
+    r.kind === "crate" ? `${r.depth}:${r.node.id}<${r.parentId}` : `${r.depth}:♪${r.path}@${r.crateId}`;
+
   it("shows only collections when nothing is expanded", () => {
-    expect(visibleRows(sample, new Set()).map((r) => [r.node.id, r.depth])).toEqual([
-      ["club", 0],
-      ["weddings", 0],
-    ]);
+    expect(visibleRows(sample, new Set()).map(describeRow)).toEqual(["0:club<null", "0:weddings<null"]);
   });
 
-  it("walks into expanded crates and records depth and parent", () => {
+  it("walks into expanded crates, subcrates first then tracks, one level deeper", () => {
     const rows = visibleRows(sample, new Set(["club", "club-house"]));
-    expect(rows.map((r) => `${r.depth}:${r.node.id}<${r.parentId}`)).toEqual([
+    expect(rows.map(describeRow)).toEqual([
       "0:club<null",
       "1:club-2024<club",
       "1:club-house<club",
       "2:deep<club-house",
+      "2:♪C:/Music/House/one.mp3@club-house",
       "0:weddings<null",
     ]);
   });
 
-  it("hides children of a collapsed crate even if their own expansion is remembered", () => {
+  it("hides everything under a collapsed crate even if deeper expansion is remembered", () => {
     const rows = visibleRows(sample, new Set(["club-house"]));
-    expect(rows.map((r) => r.node.id)).toEqual(["club", "weddings"]);
+    expect(rows.map(describeRow)).toEqual(["0:club<null", "0:weddings<null"]);
+  });
+
+  it("keys rows uniquely and knows which crate each belongs to", () => {
+    const rows = visibleRows(sample, new Set(["club", "club-house"]));
+    expect(rowKey(rows[0])).toBe("club");
+    expect(rowKey(rows[4])).toBe("club-house\u0000c:/music/house/one.mp3");
+    expect(rowCrateId(rows[4])).toBe("club-house");
+    expect(hasContents(sample[1])).toBe(false);
+    expect(hasContents(sample[0].children[1])).toBe(true);
   });
 });

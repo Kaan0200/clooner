@@ -150,7 +150,71 @@ export function addTracks(
 }
 
 function trackKey(path: string): string {
-  return path.toLowerCase();
+  return path.replace(/\\/g, "/").toLowerCase();
+}
+
+/** Removes a track from a crate. A missing crate or track is a no-op. */
+export function removeTrack(tree: CrateTree, crateId: string, path: string): CrateTree {
+  const crate = findCrate(tree, crateId);
+  if (!crate) return tree;
+  const key = trackKey(path);
+  if (!crate.tracks.some((t) => trackKey(t) === key)) return tree;
+  return mapNode(tree, crateId, (n) => ({
+    ...n,
+    tracks: n.tracks.filter((t) => trackKey(t) !== key),
+  }));
+}
+
+/**
+ * Moves a track from one crate to another, or adds it to the other while
+ * keeping it where it was when `keep` is set. Moving within the same crate
+ * changes nothing. Throws when either crate is missing.
+ */
+export function moveTrack(
+  tree: CrateTree,
+  fromId: string,
+  path: string,
+  toId: string,
+  keep = false,
+): CrateTree {
+  if (!findCrate(tree, fromId)) throw new Error("Crate not found.");
+  if (fromId === toId) return tree;
+  const added = addTracks(tree, toId, [path]).tree;
+  return keep ? added : removeTrack(added, fromId, path);
+}
+
+/** True when `id` is `ancestorId` itself or anywhere beneath it. */
+export function isWithin(tree: CrateTree, ancestorId: string, id: string): boolean {
+  if (ancestorId === id) return true;
+  return ancestorsOf(tree, id)?.some((a) => a.id === ancestorId) ?? false;
+}
+
+/**
+ * Moves a crate (with everything under it) under another crate, or to the
+ * top level when `parentId` is null. Throws when the move would put a crate
+ * inside itself or clash with a sibling's name. Moving to where it already
+ * is changes nothing.
+ */
+export function moveCrate(tree: CrateTree, id: string, parentId: string | null): CrateTree {
+  const node = findCrate(tree, id);
+  if (!node) throw new Error("Crate not found.");
+  if (parentId !== null) {
+    if (!findCrate(tree, parentId)) throw new Error("Target crate not found.");
+    if (isWithin(tree, id, parentId)) throw new Error("A crate can't be moved inside itself.");
+  }
+
+  const ancestors = ancestorsOf(tree, id) ?? [];
+  const currentParent = ancestors.length > 0 ? ancestors[ancestors.length - 1].id : null;
+  if (currentParent === parentId) return tree;
+
+  const detached = removeCrate(tree, id);
+  const siblings = parentId === null ? detached : findCrate(detached, parentId)!.children;
+  const error = crateNameError(node.name, siblings);
+  if (error) throw new Error(error);
+
+  return parentId === null
+    ? [...detached, node]
+    : mapNode(detached, parentId, (p) => ({ ...p, children: [...p.children, node] }));
 }
 
 /** Removes a crate and everything under it. A missing id is a no-op. */
@@ -160,23 +224,52 @@ export function removeCrate(tree: CrateTree, id: string): CrateTree {
     .map((n) => (hasDescendant(n, id) ? { ...n, children: removeCrate(n.children, id) } : n));
 }
 
-export interface TreeRow {
-  node: CrateNode;
-  /** 0 for collections. */
-  depth: number;
-  parentId: string | null;
+export type TreeRow =
+  | {
+      kind: "crate";
+      node: CrateNode;
+      /** 0 for collections. */
+      depth: number;
+      parentId: string | null;
+    }
+  | {
+      kind: "track";
+      /** The crate this row belongs to. */
+      crateId: string;
+      path: string;
+      depth: number;
+    };
+
+/** A string that identifies a row, for selection and keys. */
+export function rowKey(row: TreeRow): string {
+  return row.kind === "crate" ? row.node.id : `${row.crateId}\u0000${row.path.toLowerCase()}`;
+}
+
+/** The crate a row belongs to: itself for a crate row, its holder for a track row. */
+export function rowCrateId(row: TreeRow): string {
+  return row.kind === "crate" ? row.node.id : row.crateId;
+}
+
+/** True when expanding this crate would show something. */
+export function hasContents(node: CrateNode): boolean {
+  return node.children.length > 0 || node.tracks.length > 0;
 }
 
 /**
  * The rows a tree view shows, top to bottom, given which crates are
- * expanded. Children of a collapsed crate are left out.
+ * expanded. An expanded crate lists its subcrates first, then its tracks,
+ * one level deeper. Everything under a collapsed crate is left out.
  */
 export function visibleRows(tree: CrateTree, expanded: ReadonlySet<string>): TreeRow[] {
   const rows: TreeRow[] = [];
   const walk = (nodes: CrateNode[], depth: number, parentId: string | null) => {
     for (const node of nodes) {
-      rows.push({ node, depth, parentId });
-      if (expanded.has(node.id)) walk(node.children, depth + 1, node.id);
+      rows.push({ kind: "crate", node, depth, parentId });
+      if (!expanded.has(node.id)) continue;
+      walk(node.children, depth + 1, node.id);
+      for (const path of node.tracks) {
+        rows.push({ kind: "track", crateId: node.id, path, depth: depth + 1 });
+      }
     }
   };
   walk(tree, 0, null);

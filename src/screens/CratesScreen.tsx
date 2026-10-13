@@ -4,14 +4,23 @@ import type { PhysicalPosition } from "@tauri-apps/api/dpi";
 import { ChevronRight, Folder, FolderOpen, ListMusic, Music, Plus } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { isInside, normalizeRoot } from "@/core/clone";
+import { titleOf } from "@/core/m3u";
 import {
   addCrate,
   addTracks,
   ancestorsOf,
   findCrate,
+  hasContents,
+  isWithin,
+  moveCrate,
+  moveTrack,
+  removeTrack,
   renameCrate,
+  rowKey,
   visibleRows,
   type CrateNode,
+  type CrateTree,
   type TreeRow,
 } from "@/core/tree";
 import { collectAudioFiles } from "@/lib/library";
@@ -23,28 +32,53 @@ interface Props {
 }
 
 const INDENT_PX = 16;
+/** How far the pointer must travel before a press becomes a drag. */
+const DRAG_THRESHOLD_PX = 5;
+
+/** Where an in-app drag is hovering: a crate row, or the empty space (top level). */
+type DropTarget = { kind: "crate"; id: string } | { kind: "root" };
+
+interface DragState {
+  row: TreeRow;
+  startX: number;
+  startY: number;
+  x: number;
+  y: number;
+  /** False until the pointer has moved past the threshold. */
+  active: boolean;
+  target: DropTarget | null;
+  /** Ctrl or Alt held: a track is added to the target while staying where it was. */
+  keep: boolean;
+}
 
 /**
  * The crate tree. Add creates a collection when nothing is selected, or a
  * subcrate under the selected crate. A new crate opens in rename mode.
- * Dragging files from the OS onto a row adds them to that crate, and each
- * row's buttons act on that crate.
+ * An expanded crate lists its subcrates and then its tracks. Rows can be
+ * dragged: a track onto a crate moves it there (Ctrl or Alt adds it instead),
+ * a crate onto another nests it, a crate onto empty space makes it a
+ * collection. Dragging files from the OS onto a row adds them to that crate.
  */
 export default function CratesScreen({ library }: Props) {
   const tree = library.crates;
   const onChange = library.setCrates;
 
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  /** The selected row's key: a crate id, or a crate id plus a track path. */
+  const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set());
   const [editingId, setEditingId] = useState<string | null>(null);
   /** The crate under the cursor while files are being dragged over the window. */
-  const [dropTargetId, setDropTargetId] = useState<string | null>(null);
+  const [fileDropTargetId, setFileDropTargetId] = useState<string | null>(null);
+  const [drag, setDrag] = useState<DragState | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const treeRef = useRef<HTMLDivElement>(null);
 
-  // A selection can go stale if the tree changes underneath it.
-  const selected = selectedId ? findCrate(tree, selectedId) : undefined;
   const rows = visibleRows(tree, expanded);
+  // A selection can go stale if the tree changes underneath it. The crate a
+  // selected track belongs to counts as the selected crate.
+  const selectedCrateId = selectedKey?.split("\u0000")[0] ?? null;
+  const selected = selectedCrateId ? findCrate(tree, selectedCrateId) : undefined;
+  const selectedRow = rows.find((r) => rowKey(r) === selectedKey);
 
   // Playlists are written into the first clone that is connected right now.
   const playlistClone = library.clones.find(
@@ -57,16 +91,15 @@ export default function CratesScreen({ library }: Props) {
       : null;
 
   useEffect(() => {
-    if (!selectedId) return;
+    if (!selectedKey) return;
     treeRef.current
-      ?.querySelector(`[data-crate-id="${selectedId}"]`)
+      ?.querySelector(`[data-row-key="${CSS.escape(selectedKey)}"]`)
       ?.scrollIntoView({ block: "nearest" });
-  }, [selectedId, rows.length]);
+  }, [selectedKey, rows.length]);
 
-  // The drop handler needs the latest tree without re-subscribing on every
-  // change, so the subscription reads through refs.
-  const latest = useRef({ tree, onChange });
-  latest.current = { tree, onChange };
+  // Handlers that outlive a render read the latest state through refs.
+  const latest = useRef({ tree, onChange, copyToClones: library.copyToClones });
+  latest.current = { tree, onChange, copyToClones: library.copyToClones };
 
   useEffect(() => {
     // Outside Tauri (plain browser dev) there is no native drag-drop channel.
@@ -81,16 +114,16 @@ export default function CratesScreen({ library }: Props) {
         switch (payload.type) {
           case "enter":
           case "over":
-            setDropTargetId(crateAt(payload.position));
+            setFileDropTargetId(crateAt(payload.position));
             break;
           case "drop": {
-            setDropTargetId(null);
+            setFileDropTargetId(null);
             const id = crateAt(payload.position);
             if (id) void dropFiles(id, payload.paths);
             break;
           }
           case "leave":
-            setDropTargetId(null);
+            setFileDropTargetId(null);
             break;
         }
       })
@@ -127,17 +160,125 @@ export default function CratesScreen({ library }: Props) {
     const { tree: next, added } = addTracks(fresh, crateId, files);
     if (added > 0) latest.current.onChange(next);
     const skipped = files.length - added;
-    setNotice(
+    const membership =
       `${plural(added, "track")} added to "${crate.name}"` +
-        (skipped > 0 ? `, ${skipped} already there` : ""),
-    );
-    setSelectedId(crateId);
+      (skipped > 0 ? `, ${skipped} already there` : "");
+    setSelectedKey(crateId);
+    setExpandedFor(crateId, true);
+
+    // The files go onto every connected clone right away.
+    setNotice(`${membership}. Copying to clones…`);
+    const copy = await latest.current.copyToClones(files);
+    const copied =
+      copy.clones === 0
+        ? "no clone is connected, so nothing was copied"
+        : `${plural(copy.copied, "file")} copied to ${plural(copy.clones, "clone")}`;
+    setNotice(`${membership}; ${copied}.`);
   }
+
+  // --- In-app dragging of rows -------------------------------------------
+
+  const dragRef = useRef<DragState | null>(null);
+  /** Set when a drag just ended, so the click that follows doesn't reselect. */
+  const swallowClick = useRef(false);
+
+  function startDrag(row: TreeRow, e: React.PointerEvent) {
+    if (e.button !== 0 || editingId) return;
+    // Buttons and the rename field handle their own presses.
+    if ((e.target as HTMLElement).closest("button, input")) return;
+
+    const state: DragState = {
+      row,
+      startX: e.clientX,
+      startY: e.clientY,
+      x: e.clientX,
+      y: e.clientY,
+      active: false,
+      target: null,
+      keep: false,
+    };
+    dragRef.current = state;
+
+    const onMove = (ev: PointerEvent) => {
+      const current = dragRef.current;
+      if (!current) return;
+      const moved = Math.hypot(ev.clientX - current.startX, ev.clientY - current.startY);
+      if (!current.active && moved < DRAG_THRESHOLD_PX) return;
+      const next: DragState = {
+        ...current,
+        active: true,
+        x: ev.clientX,
+        y: ev.clientY,
+        target: targetAt(ev.clientX, ev.clientY),
+        keep: ev.ctrlKey || ev.altKey,
+      };
+      dragRef.current = next;
+      setDrag(next);
+      ev.preventDefault();
+    };
+
+    const onUp = (ev: PointerEvent) => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+      document.body.style.cursor = "";
+      const current = dragRef.current;
+      dragRef.current = null;
+      setDrag(null);
+      if (!current?.active) return;
+      swallowClick.current = true;
+      const keep = ev.ctrlKey || ev.altKey;
+      const target = ev.type === "pointerup" ? targetAt(ev.clientX, ev.clientY) : null;
+      if (target && dropAllowed(latest.current.tree, current.row, target, keep)) {
+        finishDrag(current.row, target, keep);
+      }
+    };
+
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
+    document.body.style.cursor = "grabbing";
+  }
+
+  /** The drop target under a point: a crate row, the tree's empty space, or nothing. */
+  function targetAt(x: number, y: number): DropTarget | null {
+    const element = document.elementFromPoint(x, y);
+    if (!element) return null;
+    const crateId = element.closest<HTMLElement>("[data-crate-id]")?.dataset.crateId;
+    if (crateId) return { kind: "crate", id: crateId };
+    return treeRef.current?.contains(element) ? { kind: "root" } : null;
+  }
+
+  function finishDrag(row: TreeRow, target: DropTarget, keep: boolean) {
+    const current = latest.current.tree;
+    try {
+      if (row.kind === "track") {
+        if (target.kind !== "crate") return;
+        const to = findCrate(current, target.id);
+        if (!to) return;
+        latest.current.onChange(moveTrack(current, row.crateId, row.path, target.id, keep));
+        setExpandedFor(target.id, true);
+        setSelectedKey(`${target.id}\u0000${row.path.toLowerCase()}`);
+        setNotice(`${keep ? "Added" : "Moved"} "${titleOf(row.path)}" ${keep ? "to" : "into"} "${to.name}"`);
+      } else {
+        const parentId = target.kind === "crate" ? target.id : null;
+        latest.current.onChange(moveCrate(current, row.node.id, parentId));
+        if (parentId) setExpandedFor(parentId, true);
+        setSelectedKey(row.node.id);
+        const where = parentId ? `into "${findCrate(current, parentId)?.name}"` : "to the top level";
+        setNotice(`Moved "${row.node.name}" ${where}`);
+      }
+    } catch (e) {
+      setNotice(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  // ------------------------------------------------------------------------
 
   async function openPlaylist(crate: CrateNode) {
     if (!library.source || !playlistClone) return;
     const names = [...(ancestorsOf(tree, crate.id) ?? []), crate].map((n) => n.name);
-    setSelectedId(crate.id);
+    setSelectedKey(crate.id);
     setNotice(`Opening "${crate.name}" as a playlist…`);
     try {
       const result = await openCratePlaylist({
@@ -171,14 +312,22 @@ export default function CratesScreen({ library }: Props) {
     const result = addCrate(tree, parentId);
     onChange(result.tree);
     if (parentId) setExpandedFor(parentId, true);
-    setSelectedId(result.node.id);
+    setSelectedKey(result.node.id);
     setEditingId(result.node.id);
     setNotice(null);
   }
 
-  function select(id: string | null) {
-    setSelectedId(id);
+  function select(key: string | null) {
+    setSelectedKey(key);
     setEditingId(null);
+  }
+
+  function removeSelectedTrack() {
+    if (selectedRow?.kind !== "track") return;
+    const crate = findCrate(tree, selectedRow.crateId);
+    onChange(removeTrack(tree, selectedRow.crateId, selectedRow.path));
+    setSelectedKey(selectedRow.crateId);
+    setNotice(`Removed "${titleOf(selectedRow.path)}" from "${crate?.name}". The file itself is untouched.`);
   }
 
   /** Commits a rename. Returns the error to show, or null when it went through. */
@@ -204,11 +353,11 @@ export default function CratesScreen({ library }: Props) {
 
   function onTreeKeyDown(e: React.KeyboardEvent) {
     if (editingId) return;
-    const index = rows.findIndex((r) => r.node.id === selectedId);
+    const index = rows.findIndex((r) => rowKey(r) === selectedKey);
     const row = index >= 0 ? rows[index] : undefined;
     const moveTo = (i: number) => {
       const target = rows[Math.max(0, Math.min(rows.length - 1, i))];
-      if (target) select(target.node.id);
+      if (target) select(rowKey(target));
     };
 
     switch (e.key) {
@@ -225,18 +374,24 @@ export default function CratesScreen({ library }: Props) {
         moveTo(rows.length - 1);
         break;
       case "ArrowRight":
-        if (!row || row.node.children.length === 0) return;
+        if (row?.kind !== "crate" || !hasContents(row.node)) return;
         if (expanded.has(row.node.id)) moveTo(index + 1);
         else setExpandedFor(row.node.id, true);
         break;
       case "ArrowLeft":
         if (!row) return;
-        if (expanded.has(row.node.id)) setExpandedFor(row.node.id, false);
+        if (row.kind === "track") select(row.crateId);
+        else if (expanded.has(row.node.id)) setExpandedFor(row.node.id, false);
         else if (row.parentId) select(row.parentId);
         break;
       case "Enter":
       case "F2":
-        if (row) setEditingId(row.node.id);
+        if (row?.kind === "crate") setEditingId(row.node.id);
+        break;
+      case "Delete":
+      case "Backspace":
+        if (row?.kind !== "track") return;
+        removeSelectedTrack();
         break;
       default:
         return;
@@ -245,7 +400,24 @@ export default function CratesScreen({ library }: Props) {
   }
 
   const addTitle = selected ? `Add a subcrate to "${selected.name}"` : "Add a collection";
-  const dragging = dropTargetId !== null;
+  const fileDragging = fileDropTargetId !== null;
+  const sourceRoot = library.source?.path ?? null;
+
+  // The crate highlighted as the target of whatever drag is in progress.
+  const activeDrag = drag?.active ? drag : null;
+  const dragAllowed =
+    activeDrag?.target ? dropAllowed(tree, activeDrag.row, activeDrag.target, activeDrag.keep) : false;
+  const targetCrateId =
+    fileDropTargetId ??
+    (dragAllowed && activeDrag?.target?.kind === "crate" ? activeDrag.target.id : null);
+  const targetRoot = dragAllowed && activeDrag?.target?.kind === "root";
+
+  const breadcrumb = selected
+    ? [...(ancestorsOf(tree, selected.id) ?? []), selected]
+        .map((n) => n.name)
+        .concat(selectedRow?.kind === "track" ? [titleOf(selectedRow.path)] : [])
+        .join(" / ")
+    : "";
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -272,49 +444,75 @@ export default function CratesScreen({ library }: Props) {
             role="tree"
             aria-label="Crates"
             tabIndex={0}
-            className="flex min-h-full flex-col p-1 outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+            className={`flex min-h-full flex-col rounded-md p-1 outline-none focus-visible:ring-2 focus-visible:ring-ring/50 ${
+              targetRoot ? "ring-2 ring-inset ring-primary" : ""
+            }`}
             onKeyDown={onTreeKeyDown}
+            onClickCapture={(e) => {
+              if (!swallowClick.current) return;
+              swallowClick.current = false;
+              e.stopPropagation();
+            }}
             // Clicking empty space clears the selection so Add makes a collection.
             onClick={(e) => {
               if (!(e.target as HTMLElement).closest('[role="treeitem"]')) select(null);
             }}
           >
-            {rows.map((row) => (
-              <CrateRow
-                key={row.node.id}
-                row={row}
-                selected={row.node.id === selectedId}
-                expanded={expanded.has(row.node.id)}
-                editing={row.node.id === editingId}
-                dropTarget={row.node.id === dropTargetId}
-                dragging={dragging}
-                playlistTitle={
-                  playlistBlocker ??
-                  (row.node.tracks.length === 0
-                    ? "This crate has no tracks yet"
-                    : `Open as a playlist from ${playlistClone!.path}`)
-                }
-                playlistEnabled={playlistBlocker === null && row.node.tracks.length > 0}
-                onSelect={() => select(row.node.id)}
-                onToggle={() => setExpandedFor(row.node.id, !expanded.has(row.node.id))}
-                onEdit={() => setEditingId(row.node.id)}
-                onCommit={(name) => commitRename(row.node.id, name)}
-                onCancel={cancelRename}
-                onOpenPlaylist={() => void openPlaylist(row.node)}
-              />
-            ))}
+            {rows.map((row) => {
+              const key = rowKey(row);
+              const beingDragged = activeDrag !== null && rowKey(activeDrag.row) === key;
+              if (row.kind === "track") {
+                return (
+                  <TrackRow
+                    key={key}
+                    rowKey={key}
+                    row={row}
+                    sourceRoot={sourceRoot}
+                    selected={key === selectedKey}
+                    dropTarget={row.crateId === targetCrateId}
+                    dragging={fileDragging}
+                    beingDragged={beingDragged}
+                    onSelect={() => select(key)}
+                    onPointerDown={(e) => startDrag(row, e)}
+                  />
+                );
+              }
+              return (
+                <CrateRow
+                  key={key}
+                  row={row}
+                  selected={key === selectedKey}
+                  expanded={expanded.has(row.node.id)}
+                  editing={row.node.id === editingId}
+                  dropTarget={row.node.id === targetCrateId}
+                  dragging={fileDragging}
+                  beingDragged={beingDragged}
+                  playlistTitle={
+                    playlistBlocker ??
+                    (row.node.tracks.length === 0
+                      ? "This crate has no tracks yet"
+                      : `Open as a playlist from ${playlistClone!.path}`)
+                  }
+                  playlistEnabled={playlistBlocker === null && row.node.tracks.length > 0}
+                  onSelect={() => select(key)}
+                  onToggle={() => setExpandedFor(row.node.id, !expanded.has(row.node.id))}
+                  onEdit={() => setEditingId(row.node.id)}
+                  onCommit={(name) => commitRename(row.node.id, name)}
+                  onCancel={cancelRename}
+                  onOpenPlaylist={() => void openPlaylist(row.node)}
+                  onPointerDown={(e) => startDrag(row, e)}
+                />
+              );
+            })}
             {/* Fills the rest of the panel so clicks below the last row deselect. */}
             <div className="flex-1" />
           </div>
         )}
       </ScrollArea>
 
-      {(notice || (selected && ancestorsOf(tree, selected.id)?.length)) && (
+      {(notice || breadcrumb.includes(" / ")) && (
         <footer className="flex items-center justify-between gap-3 border-t px-3 py-1.5 text-xs text-muted-foreground">
-          <span className="truncate">
-            {selected &&
-              [...(ancestorsOf(tree, selected.id) ?? []), selected].map((n) => n.name).join(" / ")}
-          </span>
+          <span className="truncate">{breadcrumb}</span>
           {notice && (
             <span role="status" className="min-w-0 truncate text-foreground" title={notice}>
               {notice}
@@ -322,13 +520,54 @@ export default function CratesScreen({ library }: Props) {
           )}
         </footer>
       )}
+
+      {activeDrag && <DragGhost drag={activeDrag} allowed={dragAllowed} tree={tree} />}
+    </div>
+  );
+}
+
+/** Whether a dragged row may be dropped on a target. */
+function dropAllowed(tree: CrateTree, row: TreeRow, target: DropTarget, keep: boolean): boolean {
+  if (row.kind === "track") {
+    if (target.kind !== "crate" || target.id === row.crateId) return false;
+    const to = findCrate(tree, target.id);
+    // Adding is pointless when the track is already there.
+    return !!to && (!keep || !to.tracks.some((t) => t.toLowerCase() === row.path.toLowerCase()));
+  }
+  if (target.kind === "root") return row.parentId !== null;
+  return target.id !== row.parentId && !isWithin(tree, row.node.id, target.id);
+}
+
+/** The label that follows the pointer during an in-app drag. */
+function DragGhost({ drag, allowed, tree }: { drag: DragState; allowed: boolean; tree: CrateTree }) {
+  const name = drag.row.kind === "track" ? titleOf(drag.row.path) : drag.row.node.name;
+  const Icon = drag.row.kind === "track" ? Music : Folder;
+
+  let action: string | null = null;
+  if (allowed && drag.target) {
+    if (drag.target.kind === "root") action = "Make a collection";
+    else {
+      const to = findCrate(tree, drag.target.id)?.name ?? "";
+      action = drag.row.kind === "track" && drag.keep ? `Add to "${to}"` : `Move into "${to}"`;
+    }
+  }
+
+  return (
+    <div
+      className="pointer-events-none fixed z-50 flex max-w-64 items-center gap-2 rounded-md border bg-popover px-2 py-1 text-sm shadow-md"
+      style={{ left: drag.x + 12, top: drag.y + 12 }}
+    >
+      <Icon className="size-4 shrink-0 text-muted-foreground" />
+      <span className="truncate">{name}</span>
+      {action && <span className="shrink-0 text-xs font-medium text-primary">{action}</span>}
     </div>
   );
 }
 
 /**
- * The crate row under a point reported by the native drag, which comes in
- * physical pixels relative to the webview.
+ * The crate under a point reported by the native drag, which comes in
+ * physical pixels relative to the webview. A track row stands in for the
+ * crate that holds it.
  */
 function crateAt(position: PhysicalPosition): string | null {
   const scale = window.devicePixelRatio || 1;
@@ -340,15 +579,89 @@ function plural(n: number, word: string): string {
   return `${n.toLocaleString()} ${word}${n === 1 ? "" : "s"}`;
 }
 
+/** Row background for the states a row can be in. */
+function rowBackground(dropTarget: boolean, dragging: boolean, selected: boolean): string {
+  if (dropTarget) return "bg-primary/10 ring-2 ring-inset ring-primary";
+  // While files are dragged over the window every row is a potential target,
+  // so hint at it without shouting.
+  if (dragging) return "ring-1 ring-inset ring-dashed ring-border";
+  if (selected) return "bg-muted text-foreground";
+  return "hover:bg-muted/50";
+}
+
+interface TrackRowProps {
+  rowKey: string;
+  row: Extract<TreeRow, { kind: "track" }>;
+  sourceRoot: string | null;
+  selected: boolean;
+  /** Something is being dragged over this row's crate right now. */
+  dropTarget: boolean;
+  /** Files are being dragged over the window. */
+  dragging: boolean;
+  /** This row is the one being dragged. */
+  beingDragged: boolean;
+  onSelect: () => void;
+  onPointerDown: (e: React.PointerEvent) => void;
+}
+
+function TrackRow({
+  rowKey,
+  row,
+  sourceRoot,
+  selected,
+  dropTarget,
+  dragging,
+  beingDragged,
+  onSelect,
+  onPointerDown,
+}: TrackRowProps) {
+  const path = row.path;
+  const title = titleOf(path);
+  // Where the file sits, relative to the library when it is inside it.
+  const folder = folderOf(path, sourceRoot);
+
+  return (
+    <div
+      role="treeitem"
+      aria-level={row.depth + 1}
+      aria-selected={selected}
+      data-row-key={rowKey}
+      data-crate-id={row.crateId}
+      title={path}
+      className={`flex h-7 cursor-default items-center gap-1 rounded-md pr-1 text-sm transition-colors select-none ${rowBackground(dropTarget, dragging, selected)} ${
+        beingDragged ? "opacity-40" : ""
+      }`}
+      style={{ paddingLeft: 4 + row.depth * INDENT_PX }}
+      onClick={onSelect}
+      onPointerDown={onPointerDown}
+    >
+      <span className="size-5 shrink-0" />
+      <Music className="size-3.5 shrink-0 text-muted-foreground" />
+      <span className="truncate">{title}</span>
+      {folder && <span className="ml-1 truncate text-xs text-muted-foreground">{folder}</span>}
+    </div>
+  );
+}
+
+/** The folder part of a path, relative to the library root when inside it. Empty at the root. */
+function folderOf(path: string, sourceRoot: string | null): string {
+  const normalized = normalizeRoot(path);
+  const dir = normalized.slice(0, normalized.lastIndexOf("/"));
+  if (sourceRoot && isInside(sourceRoot, dir)) return dir.slice(normalizeRoot(sourceRoot).length + 1);
+  return dir;
+}
+
 interface RowProps {
-  row: TreeRow;
+  row: Extract<TreeRow, { kind: "crate" }>;
   selected: boolean;
   expanded: boolean;
   editing: boolean;
-  /** Files are being dragged over this row right now. */
+  /** Something is being dragged over this row right now. */
   dropTarget: boolean;
-  /** Files are being dragged somewhere over the window. */
+  /** Files are being dragged over the window. */
   dragging: boolean;
+  /** This row is the one being dragged. */
+  beingDragged: boolean;
   /** Tooltip for the playlist button: what it does, or why it is disabled. */
   playlistTitle: string;
   playlistEnabled: boolean;
@@ -358,6 +671,7 @@ interface RowProps {
   onCommit: (name: string) => string | null;
   onCancel: () => void;
   onOpenPlaylist: () => void;
+  onPointerDown: (e: React.PointerEvent) => void;
 }
 
 function CrateRow({
@@ -367,6 +681,7 @@ function CrateRow({
   editing,
   dropTarget,
   dragging,
+  beingDragged,
   playlistTitle,
   playlistEnabled,
   onSelect,
@@ -375,38 +690,30 @@ function CrateRow({
   onCommit,
   onCancel,
   onOpenPlaylist,
+  onPointerDown,
 }: RowProps) {
   const { node, depth } = row;
-  const hasChildren = node.children.length > 0;
-  const Icon = expanded && hasChildren ? FolderOpen : Folder;
-
-  let background: string;
-  if (dropTarget) {
-    background = "bg-primary/10 ring-2 ring-inset ring-primary";
-  } else if (dragging) {
-    // While a drag is in progress every row is a potential target, so hint at
-    // it without shouting.
-    background = "ring-1 ring-inset ring-dashed ring-border";
-  } else if (selected) {
-    background = "bg-muted text-foreground";
-  } else {
-    background = "hover:bg-muted/50";
-  }
+  const expandable = hasContents(node);
+  const Icon = expanded && expandable ? FolderOpen : Folder;
 
   return (
     <div
       role="treeitem"
       aria-level={depth + 1}
       aria-selected={selected}
-      aria-expanded={hasChildren ? expanded : undefined}
+      aria-expanded={expandable ? expanded : undefined}
+      data-row-key={node.id}
       data-crate-id={node.id}
       data-drop-target={dropTarget || undefined}
-      className={`group/row flex h-8 cursor-default items-center gap-1 rounded-md pr-1 text-sm transition-colors select-none ${background}`}
+      className={`group/row flex h-8 cursor-default items-center gap-1 rounded-md pr-1 text-sm transition-colors select-none ${rowBackground(dropTarget, dragging, selected)} ${
+        beingDragged ? "opacity-40" : ""
+      }`}
       style={{ paddingLeft: 4 + depth * INDENT_PX }}
       onClick={onSelect}
       onDoubleClick={onEdit}
+      onPointerDown={onPointerDown}
     >
-      {hasChildren ? (
+      {expandable ? (
         <button
           type="button"
           tabIndex={-1}
@@ -433,7 +740,7 @@ function CrateRow({
       )}
 
       {dropTarget ? (
-        <span className="ml-auto shrink-0 pr-1 text-xs font-medium text-primary">Drop to add</span>
+        <span className="ml-auto shrink-0 pr-1 text-xs font-medium text-primary">Drop here</span>
       ) : (
         <span className="ml-auto flex shrink-0 items-center gap-1">
           {node.tracks.length > 0 && (

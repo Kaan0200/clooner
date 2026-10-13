@@ -1,11 +1,13 @@
-// Planning a one-way sync from the source library into a clone.
+// Planning what goes into a clone.
 //
-// The plan is pure: given the roots and the crate tree it works out which
-// files belong in the clone, where each goes, and what generated files are
-// needed. The I/O that carries it out lives in `lib/sync.ts`.
+// Two separate behaviours use this module:
+//   - Dropping tracks on a crate copies those files into every connected
+//     clone right away (`planTracks`).
+//   - Sync writes the current crate contents as Serato `.crate` files into
+//     the clone's `_Serato_` folder (`planCrates`).
+// Both are pure; the I/O that carries them out lives in `lib/sync.ts`.
 
-import { cloneCrateFolder, cloneTrackPath, normalizeRoot } from "./clone";
-import { titleOf } from "./m3u";
+import { cloneTrackPath, normalizeRoot } from "./clone";
 import { encodeName } from "./names";
 import type { CrateNode, CrateTree } from "./tree";
 
@@ -18,79 +20,75 @@ export interface TrackJob {
   clonePath: string;
 }
 
+export interface TrackPlan {
+  /** Each track once, even if it was given twice, in the order first seen. */
+  tracks: TrackJob[];
+  /** Tracks that aren't under the source root, so have no place in a clone. */
+  outside: string[];
+}
+
+/** Where each of some source tracks belongs in the clone. */
+export function planTracks(sourceRoot: string, cloneRoot: string, paths: string[]): TrackPlan {
+  const root = normalizeRoot(sourceRoot);
+  const unique = new Map<string, TrackJob>();
+  const outside: string[] = [];
+  for (const track of paths) {
+    const clonePath = cloneTrackPath(root, cloneRoot, track);
+    if (clonePath === null) {
+      outside.push(track);
+      continue;
+    }
+    const relative = normalizeRoot(track).slice(root.length + 1);
+    const key = relative.toLowerCase();
+    if (!unique.has(key)) unique.set(key, { source: track, relative, clonePath });
+  }
+  return { tracks: [...unique.values()], outside };
+}
+
 export interface CrateJob {
   /** The crate's path in the tree, outermost first. */
   names: string[];
   tracks: TrackJob[];
-  /** Member tracks that aren't under the source root, so can't be cloned. */
-  outside: string[];
-  /** One stub playlist per track: its file inside the crate's folder. */
-  stubs: { file: string; track: TrackJob }[];
-}
-
-export interface SyncPlan {
-  crates: CrateJob[];
-  /** Every track to copy, once each even when it is in several crates. */
-  tracks: TrackJob[];
+  /** Member tracks that aren't under the source root, so can't be in the clone. */
   outside: string[];
 }
 
-export function planSync(sourceRoot: string, cloneRoot: string, crates: CrateTree): SyncPlan {
-  const root = normalizeRoot(sourceRoot);
+/** Every crate in the tree with its member tracks' places in the clone. */
+export function planCrates(sourceRoot: string, cloneRoot: string, crates: CrateTree): CrateJob[] {
   const jobs: CrateJob[] = [];
-  const unique = new Map<string, TrackJob>();
-  const outside = new Set<string>();
-
   const walk = (nodes: CrateNode[], ancestors: string[]) => {
     for (const node of nodes) {
       const names = [...ancestors, node.name];
-      const job: CrateJob = { names, tracks: [], outside: [], stubs: [] };
-      for (const track of node.tracks) {
-        const clonePath = cloneTrackPath(root, cloneRoot, track);
-        if (clonePath === null) {
-          job.outside.push(track);
-          outside.add(track);
-          continue;
-        }
-        const relative = normalizeRoot(track).slice(root.length + 1);
-        const key = relative.toLowerCase();
-        const existing = unique.get(key);
-        const trackJob = existing ?? { source: track, relative, clonePath };
-        if (!existing) unique.set(key, trackJob);
-        job.tracks.push(trackJob);
-      }
-      job.stubs = stubFiles(cloneRoot, names, job.tracks);
-      jobs.push(job);
+      const plan = planTracks(sourceRoot, cloneRoot, node.tracks);
+      jobs.push({ names, tracks: plan.tracks, outside: plan.outside });
       walk(node.children, names);
     }
   };
   walk(crates, []);
-
-  return { crates: jobs, tracks: [...unique.values()], outside: [...outside] };
+  return jobs;
 }
 
-/**
- * One `.m3u` per track inside the crate's folder, named after the track's
- * file. Two tracks with the same file name in different folders get a
- * numbered suffix so neither overwrites the other.
- */
-function stubFiles(cloneRoot: string, names: string[], tracks: TrackJob[]) {
-  const folder = cloneCrateFolder(cloneRoot, names);
-  const used = new Set<string>();
-  return tracks.map((track) => {
-    const base = titleOf(track.source);
-    let name = base;
-    for (let n = 2; used.has(name.toLowerCase()); n++) name = `${base} (${n})`;
-    used.add(name.toLowerCase());
-    return { file: `${folder}/${encodeName(name)}.m3u`, track };
-  });
-}
-
-/** What was known about a source file when it was last copied. */
-export interface SyncedEntry {
+/** Size and modification time of a file, enough to notice it changed. */
+export interface FileState {
   size: number;
   /** Modification time in milliseconds, or null when the platform gave none. */
   mtime: number | null;
+}
+
+/** Both sides of a track as they were right after the last copy. */
+export interface SyncRecord {
+  source: FileState;
+  clone: FileState;
+}
+
+/** FAT and exFAT keep modification times to two seconds. */
+export const MTIME_TOLERANCE_MS = 2000;
+
+/** True when two states describe the same content, allowing for coarse timestamps. */
+export function sameFile(a: FileState, b: FileState): boolean {
+  if (a.size !== b.size) return false;
+  if (a.mtime === null || b.mtime === null) return a.mtime === b.mtime;
+  return Math.abs(a.mtime - b.mtime) <= MTIME_TOLERANCE_MS;
 }
 
 /**
@@ -100,12 +98,53 @@ export interface SyncedEntry {
  * check honest on drives and platforms that don't preserve timestamps.
  */
 export function needsCopy(
-  previous: SyncedEntry | undefined,
-  current: SyncedEntry,
+  previous: SyncRecord | undefined,
+  current: FileState,
   presentInClone: boolean,
 ): boolean {
   if (!presentInClone || !previous) return true;
-  return previous.size !== current.size || previous.mtime !== current.mtime;
+  return !sameFile(previous.source, current);
+}
+
+export type Direction = "toClone" | "toSource" | "none" | "missing";
+
+export interface Decision {
+  direction: Direction;
+  /** Both sides changed since the last copy; the newer one was chosen. */
+  bothChanged: boolean;
+}
+
+/**
+ * Which way a track should be copied during a sync. With a record of the
+ * last copy, only the side that changed is copied over the other. When both
+ * changed, or there is no record and the files differ, the newer file wins,
+ * with the source winning ties since it is the library.
+ */
+export function decideSync(
+  record: SyncRecord | undefined,
+  source: FileState | null,
+  clone: FileState | null,
+): Decision {
+  if (!source && !clone) return { direction: "missing", bothChanged: false };
+  if (!clone) return { direction: "toClone", bothChanged: false };
+  if (!source) return { direction: "toSource", bothChanged: false };
+
+  if (record) {
+    const sourceChanged = !sameFile(record.source, source);
+    const cloneChanged = !sameFile(record.clone, clone);
+    if (!sourceChanged && !cloneChanged) return { direction: "none", bothChanged: false };
+    if (sourceChanged && !cloneChanged) return { direction: "toClone", bothChanged: false };
+    if (!sourceChanged && cloneChanged) return { direction: "toSource", bothChanged: false };
+    return { direction: newer(source, clone), bothChanged: true };
+  }
+
+  if (sameFile(source, clone)) return { direction: "none", bothChanged: false };
+  return { direction: newer(source, clone), bothChanged: false };
+}
+
+function newer(source: FileState, clone: FileState): Direction {
+  if (source.mtime === null || clone.mtime === null) return "toClone";
+  return clone.mtime - source.mtime > MTIME_TOLERANCE_MS ? "toSource" : "toClone";
 }
 
 /**

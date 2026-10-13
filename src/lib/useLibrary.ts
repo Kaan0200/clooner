@@ -17,7 +17,7 @@ import {
   type ScanResult,
 } from "@/lib/library";
 import { loadDb, saveDb } from "@/lib/store";
-import { syncClone as runSync, type SyncSummary } from "@/lib/sync";
+import { copyTracks, syncClone as runSync, type CopySummary, type SyncSummary } from "@/lib/sync";
 
 export type SourceStatus =
   | { kind: "scanning" }
@@ -25,12 +25,22 @@ export type SourceStatus =
   | { kind: "missing" }
   | { kind: "error"; message: string };
 
+export interface ReadyStatus {
+  kind: "ready";
+  result: CloneResult;
+  /** The last sync (crate files written) in this session. */
+  lastSync?: SyncSummary;
+  /** The last copy of dropped tracks in this session. */
+  lastCopy?: CopySummary;
+}
+
 export type CloneStatus =
   /** The source isn't available, so the clone can't be checked yet. */
   | { kind: "waiting" }
   | { kind: "attaching"; progress: string }
-  | { kind: "ready"; result: CloneResult; summary?: SyncSummary }
-  | { kind: "syncing"; result: CloneResult; progress: string }
+  | ReadyStatus
+  /** A copy or a sync is running; `ready` is restored when it finishes. */
+  | { kind: "working"; progress: string; ready: ReadyStatus }
   | { kind: "missing" }
   | { kind: "error"; message: string };
 
@@ -55,8 +65,13 @@ export interface Library {
   addClone: () => Promise<void>;
   /** Forgets a clone. Nothing on disk is touched. */
   removeClone: (path: string) => void;
-  /** Copies every crate's tracks into the clone and writes its crates and playlists. */
+  /** Writes the current crate contents as Serato crate files into the clone. */
   syncClone: (path: string) => Promise<void>;
+  /**
+   * Copies tracks into every connected clone, right away. Resolves to how
+   * many clones received them and how many files were actually copied.
+   */
+  copyToClones: (paths: string[]) => Promise<{ clones: number; copied: number }>;
   /** Rescans the source and re-attaches every clone. */
   rescan: () => Promise<void>;
 }
@@ -239,28 +254,67 @@ export function useLibrary(): Library {
       const current = dbRef.current;
       const status = cloneStatusRef.current[path];
       if (!current?.source || status?.kind !== "ready") return;
-      const { result } = status;
 
       setError(null);
       setBusy(true);
-      setClone(path, { kind: "syncing", result, progress: "Starting…" });
+      setClone(path, { kind: "working", progress: "Starting…", ready: status });
       try {
-        const summary = await runSync(current.source.path, path, current.crates, (progress) =>
-          setClone(path, { kind: "syncing", result, progress }),
+        const lastSync = await runSync(current.source.path, path, current.crates, (progress) =>
+          setClone(path, { kind: "working", progress, ready: status }),
         );
-        setClone(path, { kind: "ready", result, summary });
+        setClone(path, { ...status, lastSync });
         update((d) => ({
           ...d,
-          clones: d.clones.map((c) => (c.path === path ? { ...c, lastSync: summary.finished } : c)),
+          clones: d.clones.map((c) => (c.path === path ? { ...c, lastSync: lastSync.finished } : c)),
         }));
       } catch (e) {
-        setClone(path, { kind: "ready", result });
+        setClone(path, status);
         setError(`Sync failed: ${message(e)}`);
       } finally {
         setBusy(false);
       }
     },
     [setClone, update],
+  );
+
+  const copyToClones = useCallback(
+    async (paths: string[]) => {
+      const current = dbRef.current;
+      const totals = { clones: 0, copied: 0 };
+      if (!current?.source || paths.length === 0) return totals;
+      const sourcePath = current.source.path;
+
+      // Only clones that are attached right now can receive files.
+      const targets = current.clones.flatMap((c) => {
+        const status = cloneStatusRef.current[c.path];
+        return status?.kind === "ready" ? [{ path: c.path, status }] : [];
+      });
+      if (targets.length === 0) return totals;
+
+      setBusy(true);
+      try {
+        await Promise.all(
+          targets.map(async ({ path, status }) => {
+            setClone(path, { kind: "working", progress: "Copying…", ready: status });
+            try {
+              const lastCopy = await copyTracks(sourcePath, path, paths, (progress) =>
+                setClone(path, { kind: "working", progress, ready: status }),
+              );
+              setClone(path, { ...status, lastCopy });
+              totals.clones += 1;
+              totals.copied += lastCopy.copied;
+            } catch (e) {
+              setClone(path, status);
+              setError(`Couldn't copy to ${path}: ${message(e)}`);
+            }
+          }),
+        );
+      } finally {
+        setBusy(false);
+      }
+      return totals;
+    },
+    [setClone],
   );
 
   const rescan = useCallback(async () => {
@@ -282,6 +336,7 @@ export function useLibrary(): Library {
     addClone,
     removeClone,
     syncClone,
+    copyToClones,
     rescan,
   };
 }

@@ -2,7 +2,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { exists, mkdir, readDir, readTextFile, stat, writeTextFile } from "@tauri-apps/plugin-fs";
 import { isAudioFile } from "@/core/audio";
 import { cloneFolders, isInside, leafFolders, normalizeRoot } from "@/core/clone";
-import type { SyncedEntry } from "@/core/sync";
+import type { SyncRecord } from "@/core/sync";
 
 export interface ScanResult {
   tracks: number;
@@ -32,8 +32,12 @@ export interface CloneDb {
   attached?: string;
   /** When the clone was last synced, as ISO 8601. */
   lastSync?: string;
-  /** The source state of each copied track, keyed by its source-relative path. */
-  synced?: Record<string, SyncedEntry>;
+  /**
+   * Both sides of each copied track as of its last copy, keyed by its
+   * source-relative path. Older markers hold only the source state here;
+   * `syncRecords` in lib/sync.ts normalizes them.
+   */
+  synced?: Record<string, SyncRecord | SyncRecord["source"]>;
 }
 
 /** The marker file's path for a clone root. */
