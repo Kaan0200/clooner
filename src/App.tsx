@@ -1,38 +1,44 @@
-import { FolderPlus, FolderTree, HardDrive, RefreshCw, ScanSearch } from "lucide-react";
+import { useState } from "react";
+import { FolderTree, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { ScrollArea } from "@/components/ui/scroll-area";
+import CratesScreen from "@/screens/CratesScreen";
+import SyncScreen from "@/screens/SyncScreen";
 
-const actions = [
-  { icon: HardDrive, label: "Locations" },
-  { icon: FolderTree, label: "Collections" },
-  { icon: FolderPlus, label: "New crate" },
-  { icon: ScanSearch, label: "Scan" },
-  { icon: RefreshCw, label: "Sync" },
-];
+type View = "crates" | "sync" | "settings";
 
 export default function App() {
+  const [view, setView] = useState<View>("crates");
+
   return (
     <div className="flex h-screen flex-col bg-background text-foreground">
-      <header className="flex shrink-0 gap-2 border-b p-2">
-        {actions.map(({ icon: Icon, label }) => (
-          <Button
-            key={label}
-            variant="outline"
-            size="icon-lg"
-            aria-label={label}
-            title={label}
-          >
-            <Icon />
-          </Button>
-        ))}
+      <header className="flex justify-between border-b p-2">
+        <Button
+          variant={view === "crates" ? "default" : "outline"}
+          size="lg"
+          aria-label="Crates"
+          aria-pressed={view === "crates"}
+          title="Crates"
+          onClick={() => setView("crates")}
+        >
+          <FolderTree />
+          <span>Crates</span>
+        </Button>
+
+        <Button
+          variant={view === "sync" ? "default" : "outline"}
+          size="lg"
+          aria-label="Sync"
+          aria-pressed={view === "sync"}
+          title="Sync"
+          onClick={() => setView("sync")}
+        >
+          <RefreshCw />
+          <span>Sync</span>
+        </Button>
       </header>
 
-      <ScrollArea className="min-h-0 flex-1">
-        <div className="p-2 text-sm text-muted-foreground">
-          {/* Crate tree goes here */}
-          No crates yet.
-        </div>
-      </ScrollArea>
+      {view === "crates" && <CratesScreen />}
+      {view === "sync" && <SyncScreen />}
     </div>
   );
 }
