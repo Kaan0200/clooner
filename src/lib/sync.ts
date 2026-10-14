@@ -95,6 +95,12 @@ export async function copyTracks(
   return summary;
 }
 
+export interface SyncConflict {
+  /** The track's source path. */
+  path: string;
+  kept: "source" | "clone";
+}
+
 export interface SyncSummary {
   /** Files copied from the source into the clone. */
   toClone: number;
@@ -104,6 +110,8 @@ export interface SyncSummary {
   unchanged: number;
   /** Files that had changed on both sides; the newer one was kept. */
   bothChanged: number;
+  /** Which files those were, and whose copy won. */
+  conflicts: SyncConflict[];
   /** Crate members missing from both the source and the clone. */
   missing: number;
   /** Crate members outside the source library, left out of the crate files. */
@@ -137,6 +145,7 @@ export async function syncClone(
     toSource: 0,
     unchanged: 0,
     bothChanged: 0,
+    conflicts: [],
     missing: 0,
     outside: 0,
     crates: 0,
@@ -164,7 +173,13 @@ export async function syncClone(
       fileState(track.clonePath),
     ]);
     const decision = decideSync(synced[track.relative], source, clone);
-    if (decision.bothChanged) summary.bothChanged += 1;
+    if (decision.bothChanged) {
+      summary.bothChanged += 1;
+      summary.conflicts.push({
+        path: track.source,
+        kept: decision.direction === "toSource" ? "clone" : "source",
+      });
+    }
     switch (decision.direction) {
       case "toClone":
         synced[track.relative] = await copy(track.source, track.clonePath);

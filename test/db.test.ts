@@ -5,7 +5,13 @@ const full: AppDb = {
   version: DB_VERSION,
   source: { path: "C:/Music", added: "2026-10-13T00:00:00.000Z" },
   clones: [
-    { path: "E:/", id: "abc", added: "2026-10-13T01:00:00.000Z", lastSync: "2026-10-13T02:00:00.000Z" },
+    {
+      path: "E:/",
+      id: "abc",
+      added: "2026-10-13T01:00:00.000Z",
+      lastSync: "2026-10-13T02:00:00.000Z",
+      conflicts: [{ path: "C:/Music/a.mp3", kept: "clone", when: "2026-10-13T02:00:00.000Z" }],
+    },
   ],
   crates: [
     {
@@ -15,6 +21,7 @@ const full: AppDb = {
       tracks: [],
     },
   ],
+  durations: { "c:/music/a.mp3": 212.5 },
 };
 
 describe("app database", () => {
@@ -47,8 +54,25 @@ describe("app database", () => {
   it("drops bad clone entries and defaults their fields", () => {
     const db = parseDb(JSON.stringify({ clones: [{ path: "E:/" }, { id: "x" }, 7] }));
     expect(db.clones).toEqual([
-      { path: "E:/", id: null, added: new Date(0).toISOString(), lastSync: null },
+      { path: "E:/", id: null, added: new Date(0).toISOString(), lastSync: null, conflicts: [] },
     ]);
+  });
+
+  it("keeps only usable conflicts and defaults their fields", () => {
+    const db = parseDb(
+      JSON.stringify({
+        clones: [{ path: "E:/", conflicts: [{ path: "C:/a.mp3", kept: "bogus" }, { kept: "clone" }, "x"] }],
+      }),
+    );
+    expect(db.clones[0].conflicts).toEqual([
+      { path: "C:/a.mp3", kept: "source", when: new Date(0).toISOString() },
+    ]);
+  });
+
+  it("keeps only sensible track lengths", () => {
+    const db = parseDb(JSON.stringify({ durations: { a: 10, b: -1, c: "12", d: Infinity } }));
+    expect(db.durations).toEqual({ a: 10 });
+    expect(parseDb(JSON.stringify({ durations: [1, 2] })).durations).toEqual({});
   });
 
   it("repairs crates with missing ids or tracks and drops duplicates", () => {

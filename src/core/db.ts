@@ -4,6 +4,7 @@
 // crate tree. This module only knows the shape and how to read it
 // tolerantly; where it lives on disk is the store's business.
 
+import type { Conflict } from "./issues";
 import type { CrateNode, CrateTree } from "./tree";
 
 export const DB_VERSION = 1;
@@ -24,6 +25,8 @@ export interface CloneEntry {
   added: string;
   /** When it was last synced from the source, ISO 8601, or null if never. */
   lastSync: string | null;
+  /** Files changed on both sides at the last sync, kept until the next one. */
+  conflicts: Conflict[];
 }
 
 export interface AppDb {
@@ -31,10 +34,12 @@ export interface AppDb {
   source: SourceEntry | null;
   clones: CloneEntry[];
   crates: CrateTree;
+  /** Track lengths in seconds, keyed by normalized lower-case path (see core/duration.ts). */
+  durations: Record<string, number>;
 }
 
 export function emptyDb(): AppDb {
-  return { version: DB_VERSION, source: null, clones: [], crates: [] };
+  return { version: DB_VERSION, source: null, clones: [], crates: [], durations: {} };
 }
 
 export function serializeDb(db: AppDb): string {
@@ -66,7 +71,17 @@ export function parseDb(text: string): AppDb {
     source: parseSource(raw.source),
     clones: Array.isArray(raw.clones) ? raw.clones.flatMap((c) => optional(parseClone(c))) : [],
     crates: parseCrates(raw.crates),
+    durations: parseDurations(raw.durations),
   };
+}
+
+function parseDurations(value: unknown): Record<string, number> {
+  if (!isRecord(value)) return {};
+  const out: Record<string, number> = {};
+  for (const [key, seconds] of Object.entries(value)) {
+    if (typeof seconds === "number" && Number.isFinite(seconds) && seconds >= 0) out[key] = seconds;
+  }
+  return out;
 }
 
 function parseSource(value: unknown): SourceEntry | null {
@@ -81,6 +96,16 @@ function parseClone(value: unknown): CloneEntry | null {
     id: typeof value.id === "string" ? value.id : null,
     added: isoOr(value.added),
     lastSync: typeof value.lastSync === "string" ? value.lastSync : null,
+    conflicts: Array.isArray(value.conflicts) ? value.conflicts.flatMap((c) => optional(parseConflict(c))) : [],
+  };
+}
+
+function parseConflict(value: unknown): Conflict | null {
+  if (!isRecord(value) || typeof value.path !== "string" || value.path === "") return null;
+  return {
+    path: value.path,
+    kept: value.kept === "clone" ? "clone" : "source",
+    when: isoOr(value.when),
   };
 }
 

@@ -149,7 +149,8 @@ export function addTracks(
   };
 }
 
-function trackKey(path: string): string {
+/** A track's identity: its path with forward slashes, case-folded. */
+export function trackKey(path: string): string {
   return path.replace(/\\/g, "/").toLowerCase();
 }
 
@@ -253,6 +254,18 @@ export function rowCrateId(row: TreeRow): string {
 /** True when expanding this crate would show something. */
 export function hasContents(node: CrateNode): boolean {
   return node.children.length > 0 || node.tracks.length > 0;
+}
+
+/** How many subcrates and tracks a crate holds, at every level below it. */
+export function countContents(node: CrateNode): { crates: number; tracks: number } {
+  let crates = 0;
+  let tracks = node.tracks.length;
+  for (const child of node.children) {
+    const below = countContents(child);
+    crates += 1 + below.crates;
+    tracks += below.tracks;
+  }
+  return { crates, tracks };
 }
 
 /**

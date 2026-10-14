@@ -59,6 +59,10 @@ export interface Library {
   cloneStatus: Record<string, CloneStatus>;
   crates: CrateTree;
   setCrates: (tree: CrateTree) => void;
+  /** Known track lengths in seconds, keyed as in core/duration.ts. */
+  durations: Record<string, number>;
+  /** Records freshly read track lengths. */
+  setDurations: (updates: Record<string, number>) => void;
   /** Picks a library root. Replaces the current source and re-attaches clones to it. */
   addSource: () => Promise<void>;
   /** Picks a folder and makes it a clone, or re-attaches an existing one. */
@@ -226,7 +230,13 @@ export function useLibrary(): Library {
       return;
     }
 
-    const clone: CloneEntry = { path, id: null, added: new Date().toISOString(), lastSync: null };
+    const clone: CloneEntry = {
+      path,
+      id: null,
+      added: new Date().toISOString(),
+      lastSync: null,
+      conflicts: [],
+    };
     setBusy(true);
     update((d) => ({ ...d, clones: [...d.clones, clone] }));
     try {
@@ -265,7 +275,15 @@ export function useLibrary(): Library {
         setClone(path, { ...status, lastSync });
         update((d) => ({
           ...d,
-          clones: d.clones.map((c) => (c.path === path ? { ...c, lastSync: lastSync.finished } : c)),
+          clones: d.clones.map((c) =>
+            c.path === path
+              ? {
+                  ...c,
+                  lastSync: lastSync.finished,
+                  conflicts: lastSync.conflicts.map((k) => ({ ...k, when: lastSync.finished })),
+                }
+              : c,
+          ),
         }));
       } catch (e) {
         setClone(path, status);
@@ -317,6 +335,12 @@ export function useLibrary(): Library {
     [setClone],
   );
 
+  const setDurations = useCallback(
+    (updates: Record<string, number>) =>
+      update((d) => ({ ...d, durations: { ...d.durations, ...updates } })),
+    [update],
+  );
+
   const rescan = useCallback(async () => {
     if (dbRef.current) await refreshAll(dbRef.current);
   }, [refreshAll]);
@@ -332,6 +356,8 @@ export function useLibrary(): Library {
     cloneStatus,
     crates: db?.crates ?? [],
     setCrates,
+    durations: db?.durations ?? EMPTY_DURATIONS,
+    setDurations,
     addSource,
     addClone,
     removeClone,
@@ -340,6 +366,9 @@ export function useLibrary(): Library {
     rescan,
   };
 }
+
+/** A stable empty map, so consumers don't see a new object every render. */
+const EMPTY_DURATIONS: Record<string, number> = {};
 
 function message(e: unknown): string {
   return e instanceof Error ? e.message : String(e);

@@ -9,6 +9,7 @@ import {
   isWithin,
   moveCrate,
   moveTrack,
+  countContents,
   removeCrate,
   removeTrack,
   renameCrate,
@@ -208,6 +209,21 @@ describe("isWithin and moveCrate", () => {
     expect(() => moveCrate(clash, "club-house", "weddings")).toThrow(/already a crate/);
     expect(moveCrate(sample, "deep", "club-house")).toBe(sample);
     expect(() => moveCrate(sample, "nope", null)).toThrow(/not found/);
+  });
+});
+
+describe("countContents", () => {
+  it("counts subcrates and tracks at every level", () => {
+    const node = {
+      id: "a",
+      name: "A",
+      tracks: ["1.mp3"],
+      children: [
+        { id: "b", name: "B", tracks: ["2.mp3", "3.mp3"], children: [{ id: "c", name: "C", tracks: [], children: [] }] },
+      ],
+    };
+    expect(countContents(node)).toEqual({ crates: 2, tracks: 3 });
+    expect(countContents({ id: "e", name: "E", tracks: [], children: [] })).toEqual({ crates: 0, tracks: 0 });
   });
 });
 

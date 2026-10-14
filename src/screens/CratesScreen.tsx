@@ -1,23 +1,29 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { confirm } from "@tauri-apps/plugin-dialog";
 import type { PhysicalPosition } from "@tauri-apps/api/dpi";
 import { ChevronRight, Folder, FolderOpen, ListMusic, Music, Plus } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { isInside, normalizeRoot } from "@/core/clone";
+import { durationKey, formatDuration, sumDurations } from "@/core/duration";
+import { trackIssues, type TrackIssue } from "@/core/issues";
 import { titleOf } from "@/core/m3u";
 import {
   addCrate,
   addTracks,
   ancestorsOf,
+  countContents,
   findCrate,
   hasContents,
   isWithin,
   moveCrate,
   moveTrack,
+  removeCrate,
   removeTrack,
   renameCrate,
   rowKey,
+  trackKey,
   visibleRows,
   type CrateNode,
   type CrateTree,
@@ -25,6 +31,7 @@ import {
 } from "@/core/tree";
 import { collectAudioFiles } from "@/lib/library";
 import { openCratePlaylist } from "@/lib/playlist";
+import { useDurations } from "@/lib/useDurations";
 import type { Library } from "@/lib/useLibrary";
 
 interface Props {
@@ -74,6 +81,13 @@ export default function CratesScreen({ library }: Props) {
   const treeRef = useRef<HTMLDivElement>(null);
 
   const rows = visibleRows(tree, expanded);
+
+  // Track lengths: known ones come from the database, the rest are read from
+  // the files in the background and saved as they arrive.
+  const known = useDurations(allTrackPaths(tree), library.durations, library.setDurations);
+  // Sync conflicts and duplicates, recomputed only when the crates or clones change.
+  const issues = useMemo(() => trackIssues(tree, library.clones), [tree, library.clones]);
+
   // A selection can go stale if the tree changes underneath it. The crate a
   // selected track belongs to counts as the selected crate.
   const selectedCrateId = selectedKey?.split("\u0000")[0] ?? null;
@@ -322,12 +336,39 @@ export default function CratesScreen({ library }: Props) {
     setEditingId(null);
   }
 
-  function removeSelectedTrack() {
-    if (selectedRow?.kind !== "track") return;
-    const crate = findCrate(tree, selectedRow.crateId);
-    onChange(removeTrack(tree, selectedRow.crateId, selectedRow.path));
-    setSelectedKey(selectedRow.crateId);
-    setNotice(`Removed "${titleOf(selectedRow.path)}" from "${crate?.name}". The file itself is untouched.`);
+  /** Delete on a track takes it out of its crate; on a crate, removes the crate. */
+  async function removeSelected() {
+    if (!selectedRow) return;
+    if (selectedRow.kind === "track") {
+      const crate = findCrate(tree, selectedRow.crateId);
+      onChange(removeTrack(tree, selectedRow.crateId, selectedRow.path));
+      setSelectedKey(selectedRow.crateId);
+      setNotice(`Removed "${titleOf(selectedRow.path)}" from "${crate?.name}". The file itself is untouched.`);
+      return;
+    }
+
+    const { node, parentId } = selectedRow;
+    const inside = countContents(node);
+    // An empty crate goes without asking; one with contents is worth a pause,
+    // since a keypress would otherwise drop a whole collection.
+    if (inside.crates > 0 || inside.tracks > 0) {
+      const what = [
+        inside.crates > 0 && plural(inside.crates, "subcrate"),
+        inside.tracks > 0 && plural(inside.tracks, "track"),
+      ]
+        .filter(Boolean)
+        .join(" and ");
+      const ok = await confirm(`"${node.name}" holds ${what}. Delete the crate? Your files stay where they are.`, {
+        title: "Delete crate",
+        kind: "warning",
+        okLabel: "Delete",
+        cancelLabel: "Keep",
+      });
+      if (!ok) return;
+    }
+    onChange(removeCrate(latest.current.tree, node.id));
+    setSelectedKey(parentId);
+    setNotice(`Deleted "${node.name}". No files were touched.`);
   }
 
   /** Commits a rename. Returns the error to show, or null when it went through. */
@@ -390,8 +431,8 @@ export default function CratesScreen({ library }: Props) {
         break;
       case "Delete":
       case "Backspace":
-        if (row?.kind !== "track") return;
-        removeSelectedTrack();
+        if (!row) return;
+        void removeSelected();
         break;
       default:
         return;
@@ -472,6 +513,8 @@ export default function CratesScreen({ library }: Props) {
                     dropTarget={row.crateId === targetCrateId}
                     dragging={fileDragging}
                     beingDragged={beingDragged}
+                    duration={known[durationKey(row.path)]}
+                    issues={issues.get(trackKey(row.path))}
                     onSelect={() => select(key)}
                     onPointerDown={(e) => startDrag(row, e)}
                   />
@@ -494,6 +537,7 @@ export default function CratesScreen({ library }: Props) {
                       : `Open as a playlist from ${playlistClone!.path}`)
                   }
                   playlistEnabled={playlistBlocker === null && row.node.tracks.length > 0}
+                  length={describeLength(row.node.tracks, known)}
                   onSelect={() => select(key)}
                   onToggle={() => setExpandedFor(row.node.id, !expanded.has(row.node.id))}
                   onEdit={() => setEditingId(row.node.id)}
@@ -575,8 +619,44 @@ function crateAt(position: PhysicalPosition): string | null {
   return element?.closest<HTMLElement>("[data-crate-id]")?.dataset.crateId ?? null;
 }
 
+/** Every track path in the tree, in tree order. */
+function allTrackPaths(tree: CrateTree): string[] {
+  const out: string[] = [];
+  const walk = (nodes: CrateNode[]) => {
+    for (const node of nodes) {
+      out.push(...node.tracks);
+      walk(node.children);
+    }
+  };
+  walk(tree);
+  return out;
+}
+
+/** "12 tracks · 48:32", with a note when some lengths aren't known yet. */
+function describeLength(paths: string[], known: Record<string, number>): { text: string; title: string } {
+  const { seconds, unknown } = sumDurations(paths, known);
+  const count = plural(paths.length, "track");
+  if (unknown === paths.length) return { text: "", title: `${count}, lengths not read yet` };
+  const time = formatDuration(seconds);
+  const title =
+    unknown > 0 ? `${count}, ${time} not counting ${plural(unknown, "track")} of unknown length` : `${count}, ${time}`;
+  return { text: unknown > 0 ? `${time}+` : time, title };
+}
+
 function plural(n: number, word: string): string {
   return `${n.toLocaleString()} ${word}${n === 1 ? "" : "s"}`;
+}
+
+/** The thin bar at a row's left edge that marks it as selected. */
+function SelectionMarker({ selected }: { selected: boolean }) {
+  return (
+    <span
+      aria-hidden
+      className={`absolute top-1 bottom-1 left-0 w-0.5 rounded-full bg-primary transition-opacity ${
+        selected ? "opacity-100" : "opacity-0"
+      }`}
+    />
+  );
 }
 
 /** Row background for the states a row can be in. */
@@ -600,6 +680,10 @@ interface TrackRowProps {
   dragging: boolean;
   /** This row is the one being dragged. */
   beingDragged: boolean;
+  /** Length in seconds, when known. */
+  duration?: number;
+  /** Anything about this track that wants attention; shown as a dot. */
+  issues?: TrackIssue[];
   onSelect: () => void;
   onPointerDown: (e: React.PointerEvent) => void;
 }
@@ -612,6 +696,8 @@ function TrackRow({
   dropTarget,
   dragging,
   beingDragged,
+  duration,
+  issues,
   onSelect,
   onPointerDown,
 }: TrackRowProps) {
@@ -628,18 +714,47 @@ function TrackRow({
       data-row-key={rowKey}
       data-crate-id={row.crateId}
       title={path}
-      className={`flex h-7 cursor-default items-center gap-1 rounded-md pr-1 text-sm transition-colors select-none ${rowBackground(dropTarget, dragging, selected)} ${
+      className={`relative flex h-7 cursor-default items-center gap-1 rounded-md pr-1 text-sm transition-colors select-none ${rowBackground(dropTarget, dragging, selected)} ${
         beingDragged ? "opacity-40" : ""
       }`}
       style={{ paddingLeft: 4 + row.depth * INDENT_PX }}
       onClick={onSelect}
       onPointerDown={onPointerDown}
     >
-      <span className="size-5 shrink-0" />
+      <SelectionMarker selected={selected} />
+      {/* Where a crate row has its chevron, a track row has room for its dot. */}
+      <span className="flex size-5 shrink-0 items-center justify-center">
+        {issues && issues.length > 0 && <IssueDot issues={issues} />}
+      </span>
       <Music className="size-3.5 shrink-0 text-muted-foreground" />
       <span className="truncate">{title}</span>
       {folder && <span className="ml-1 truncate text-xs text-muted-foreground">{folder}</span>}
+      {duration !== undefined && (
+        <span className="ml-auto shrink-0 pr-1 text-xs tabular-nums text-muted-foreground">
+          {formatDuration(duration)}
+        </span>
+      )}
     </div>
+  );
+}
+
+/**
+ * The dot on a track row. Red for a sync conflict, since an edit may have
+ * been lost; amber for a duplicate. Hovering it explains every issue.
+ */
+function IssueDot({ issues }: { issues: TrackIssue[] }) {
+  const detail = issues.map((i) => i.detail).join("\n\n");
+  const color = issues[0].kind === "sync" ? "bg-destructive" : "bg-amber-500";
+  return (
+    <span
+      role="img"
+      aria-label={detail}
+      title={detail}
+      // Padding makes the dot easier to hover than its two pixels alone.
+      className="flex size-5 items-center justify-center"
+    >
+      <span className={`size-2 rounded-full ${color}`} />
+    </span>
   );
 }
 
@@ -665,6 +780,8 @@ interface RowProps {
   /** Tooltip for the playlist button: what it does, or why it is disabled. */
   playlistTitle: string;
   playlistEnabled: boolean;
+  /** The crate's total length, ready to show, and its tooltip. */
+  length: { text: string; title: string };
   onSelect: () => void;
   onToggle: () => void;
   onEdit: () => void;
@@ -684,6 +801,7 @@ function CrateRow({
   beingDragged,
   playlistTitle,
   playlistEnabled,
+  length,
   onSelect,
   onToggle,
   onEdit,
@@ -705,7 +823,7 @@ function CrateRow({
       data-row-key={node.id}
       data-crate-id={node.id}
       data-drop-target={dropTarget || undefined}
-      className={`group/row flex h-8 cursor-default items-center gap-1 rounded-md pr-1 text-sm transition-colors select-none ${rowBackground(dropTarget, dragging, selected)} ${
+      className={`group/row relative flex h-8 cursor-default items-center gap-1 rounded-md pr-1 text-sm transition-colors select-none ${rowBackground(dropTarget, dragging, selected)} ${
         beingDragged ? "opacity-40" : ""
       }`}
       style={{ paddingLeft: 4 + depth * INDENT_PX }}
@@ -713,6 +831,7 @@ function CrateRow({
       onDoubleClick={onEdit}
       onPointerDown={onPointerDown}
     >
+      <SelectionMarker selected={selected} />
       {expandable ? (
         <button
           type="button"
@@ -745,11 +864,12 @@ function CrateRow({
         <span className="ml-auto flex shrink-0 items-center gap-1">
           {node.tracks.length > 0 && (
             <span
-              className="flex items-center gap-1 pr-1 text-xs text-muted-foreground"
-              title={plural(node.tracks.length, "track")}
+              className="flex items-center gap-1 pr-1 text-xs tabular-nums text-muted-foreground"
+              title={length.title}
             >
               <Music className="size-3" />
               {node.tracks.length.toLocaleString()}
+              {length.text && <span className="text-muted-foreground/70">· {length.text}</span>}
             </span>
           )}
           {/* Row actions: shown on hover or when the row is selected. */}
