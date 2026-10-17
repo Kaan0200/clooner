@@ -107,7 +107,7 @@ function syncTitle(sourceReady: boolean, status: CloneStatus | undefined): strin
   if (!sourceReady) return "The source must be connected to sync";
   switch (status?.kind) {
     case "ready":
-      return "Copy newer files both ways, then write the crates into this clone's _Serato_ folder";
+      return "Copy newer files both ways, then write the crates and database into the drive's _Serato_ folder";
     case "working":
       return "Busy";
     case "missing":
@@ -160,6 +160,8 @@ function describeAttached(clone: CloneEntry, { existing, folders, tracks }: Clon
 
 function describeSync(s: SyncSummary): string {
   const parts = [`${s.crates.toLocaleString()} crates written`];
+  if (s.databaseAdded) parts.push(`${s.databaseAdded.toLocaleString()} tracks added to the Serato database`);
+  if (s.databaseError) parts.push(`Serato database left alone (${s.databaseError})`);
   if (s.toClone) parts.push(`${s.toClone.toLocaleString()} copied to clone`);
   if (s.toSource) parts.push(`${s.toSource.toLocaleString()} copied back to source`);
   if (s.unchanged) parts.push(`${s.unchanged.toLocaleString()} unchanged`);

@@ -6,19 +6,29 @@
 //   - `syncClone` is what the Sync button does. For every track in a crate
 //     it compares the source and clone files and copies the newer one over
 //     the other, so an edit on either side spreads. Then it writes the
-//     current crate contents as Serato `.crate` files into `_Serato_`.
+//     current crate contents as Serato `.crate` files into the `_Serato_`
+//     folder at the root of the clone's drive, and adds the tracks to the
+//     `database V2` there so Serato knows them.
 //
 // Every copy records both sides' size and modification time in the clone's
 // `clooner.json`, so the next sync can tell which side actually changed.
 
-import { copyFile, exists, mkdir, stat, writeFile } from "@tauri-apps/plugin-fs";
+import { copyFile, exists, mkdir, readFile, rename, stat, writeFile } from "@tauri-apps/plugin-fs";
 import { encodeCrate, newCrate } from "@/core/crate";
+import {
+  addTracks,
+  decodeDatabase,
+  encodeDatabase,
+  newDatabase,
+  type TrackInfo,
+} from "@/core/database";
 import {
   decideSync,
   needsCopy,
   planCrates,
   planTracks,
   seratoCrateFile,
+  seratoDatabaseFile,
   seratoSubcratesFolder,
   volumeRelative,
   type FileState,
@@ -118,6 +128,10 @@ export interface SyncSummary {
   outside: number;
   /** Crate files written. */
   crates: number;
+  /** Tracks added to the drive's Serato database because it didn't have them. */
+  databaseAdded: number;
+  /** Why the Serato database was left alone, or null when it was updated. */
+  databaseError: string | null;
   /** When the sync finished, ISO 8601. */
   finished: string;
 }
@@ -125,9 +139,10 @@ export interface SyncSummary {
 /**
  * Reconciles every crate member between the source and the clone, newer
  * file winning, then writes one Serato `.crate` file per crate into the
- * clone's `_Serato_/Subcrates`. Members are listed where they live in the
- * clone, relative to the volume root as Serato expects, even when the file
- * is missing, since the crate is the truth.
+ * drive's `_Serato_/Subcrates` and adds the tracks to its `database V2`.
+ * Members are listed where they live in the clone, relative to the volume
+ * root as Serato expects, even when the file is missing, since the crate is
+ * the truth.
  */
 export async function syncClone(
   sourceRoot: string,
@@ -149,6 +164,8 @@ export async function syncClone(
     missing: 0,
     outside: 0,
     crates: 0,
+    databaseAdded: 0,
+    databaseError: null,
     finished: "",
   };
 
@@ -162,6 +179,8 @@ export async function syncClone(
     }
   }
   const tracks = [...unique.values()];
+  /** Tracks that exist in the clone after this pass, for the Serato database. */
+  const present: TrackInfo[] = [];
   let started = 0;
   await forEachConcurrent(tracks, 4, async (track) => {
     started += 1;
@@ -195,8 +214,9 @@ export async function syncClone(
         break;
       case "missing":
         summary.missing += 1;
-        break;
+        return;
     }
+    present.push({ path: volumeRelative(track.clonePath), ...synced[track.relative].clone });
   });
 
   // 2. Crate files.
@@ -208,9 +228,36 @@ export async function syncClone(
     summary.crates += 1;
   }
 
+  // 3. The drive's Serato database. A database that can't be read is left
+  // alone rather than replaced: it is Serato's, and the crates work without it.
+  onProgress("Updating the Serato database");
+  try {
+    summary.databaseAdded = await addToDatabase(cloneRoot, present);
+  } catch (e) {
+    summary.databaseError = e instanceof Error ? e.message : String(e);
+  }
+
   summary.finished = new Date().toISOString();
   await writeCloneDb(cloneRoot, { ...db, lastSync: summary.finished, synced });
   return summary;
+}
+
+/**
+ * Adds the tracks to the drive's `database V2`, creating it if there is
+ * none, and reports how many were new. Serato's own records are kept as
+ * they are. The file is replaced in one step so a crash can't leave it half
+ * written.
+ */
+async function addToDatabase(cloneRoot: string, tracks: TrackInfo[]): Promise<number> {
+  const file = seratoDatabaseFile(cloneRoot);
+  const existing = (await exists(file)) ? decodeDatabase(await readFile(file)) : newDatabase();
+  const { database, added } = addTracks(existing, tracks, Date.now());
+  if (added === 0) return 0;
+
+  const temp = `${file}.clooner-tmp`;
+  await writeFile(temp, encodeDatabase(database));
+  await rename(temp, file);
+  return added;
 }
 
 /** The clone's copy records, upgrading entries older markers wrote with only the source state. */

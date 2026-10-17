@@ -6,6 +6,8 @@ import {
   planTracks,
   sameFile,
   seratoCrateFile,
+  seratoDatabaseFile,
+  seratoSubcratesFolder,
   volumeRelative,
   volumeRoot,
 } from "../src/core/sync";
@@ -147,6 +149,14 @@ describe("volume paths", () => {
     expect(volumeRelative("E:/Clone/Tracks/One.mp3")).toBe("Clone/Tracks/One.mp3");
     expect(volumeRelative("/Volumes/GIG/Tracks/One.mp3")).toBe("Tracks/One.mp3");
     expect(volumeRelative("/home/dj/One.mp3")).toBe("home/dj/One.mp3");
+  });
+
+  it("puts the Serato folder at the root of the drive, not inside the clone", () => {
+    expect(seratoSubcratesFolder("E:\\CLONE")).toBe("E:/_Serato_/Subcrates");
+    expect(seratoDatabaseFile("E:\\CLONE")).toBe("E:/_Serato_/database V2");
+    expect(seratoSubcratesFolder("/Volumes/GIG USB/Clone")).toBe("/Volumes/GIG USB/_Serato_/Subcrates");
+    expect(seratoSubcratesFolder("/home/dj/clone")).toBe("/_Serato_/Subcrates");
+    expect(seratoCrateFile("E:/Clone", ["Club"])).toBe("E:/_Serato_/Subcrates/Club.crate");
   });
 
   it("names crate files with %% between levels", () => {

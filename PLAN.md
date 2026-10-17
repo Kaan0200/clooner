@@ -110,12 +110,20 @@ Implemented in `src/core/crate.ts`, following the community format docs (see Ref
 - `otrk` { `ptrk` track path }, one per track.
 - Track paths are relative to the volume root and use `/`.
 - Crate files are flat. `%%` in a file name marks a subcrate.
-- Crates live in `~/Music/_Serato_/Subcrates` for the system drive, and in `<Volume>/_Serato_/Subcrates` for external drives.
+- Crates live in `~/Music/_Serato_/Subcrates` for the system drive, and in `<Volume>/_Serato_/Subcrates` for external drives. The app writes to the volume root, so a clone at `E:\CLONE` gets its crates in `E:\_Serato_\Subcrates`; a clone on the system drive isn't supported yet.
+
+## Database format reference
+
+Implemented in `src/core/database.ts`, from databases Serato wrote on Windows. Same field encoding as crates (`src/core/tlv.ts`), plus `u` 32-bit and `s` 16-bit numbers.
+
+- `vrsn`: `2.0/Serato Scratch LIVE Database`.
+- `otrk` per track: `ttyp` file type (`mp3`, `wave`, `aiff`, ...), `pfil` path relative to the volume root, text tags (`tsng`, `tart`, `talb`, `tgen`, `tlen`, `tsiz`, `tbit`, `tsmp`, `tbpm`, `tkey`, `tcom`, `ttyr`), `tadd` and `uadd` date added (Unix seconds, as text and as a number), `ulbl` label colour (`0xFFFFFF` for none), `utme` file modified, `ufsb` file size, `sbav`, then flags `bhrt bmis bply blop bitu bovc bcrt biro bwlb bwll buns bbgl bkrk bstm`.
+- Sync merges: Serato's records and unknown fields are kept byte for byte, and tracks it lacks are appended with the file-system fields only.
 
 ## Later (v2)
 
-- **Write `database V2`** so Serato shows updated tags right after a sync, with no "Reload ID3 Tags" rescan. Implement it in TS, using the projects in References for the format, not as dependencies.
-- v1 writes crate files only. It may *read* `database V2`, for example to see which tracks Serato marks as missing.
+- **Tags in `database V2`.** Sync already adds every clone track to the drive's `database V2` (`src/core/database.ts`), but only with what the file system knows: type, path, size and times. Serato reads the tags itself. Writing the tags too would let Serato show retagged files right after a sync, with no "Reload ID3 Tags" rescan, and needs a tag reader (ID3, MP4, FLAC) in TS.
+- Read `database V2` for Serato's view, for example which tracks it marks as missing.
 
 ## Serato behaviour tests (step 2)
 

@@ -15,7 +15,7 @@ export default function App() {
 
   return (
     <div className="flex h-screen flex-col bg-background text-foreground">
-      <header className="flex justify-between border-b p-2">
+      <header className="flex justify-between border-b p-2 gb-muted">
         <Button
           variant={view === "crates" ? "default" : "outline"}
           size="lg"

@@ -166,9 +166,22 @@ export function volumeRelative(path: string): string {
   return p.slice(volumeRoot(p).length).replace(/^\/+/, "");
 }
 
-/** The clone's `_Serato_/Subcrates` folder. */
+/**
+ * The `_Serato_` folder Serato reads for the clone: at the root of the
+ * clone's volume, not inside the clone. Serato only looks there.
+ */
+export function seratoFolder(cloneRoot: string): string {
+  return `${volumeRoot(cloneRoot).replace(/\/$/, "")}/_Serato_`;
+}
+
+/** Where the crate files go. */
 export function seratoSubcratesFolder(cloneRoot: string): string {
-  return `${normalizeRoot(cloneRoot)}/_Serato_/Subcrates`;
+  return `${seratoFolder(cloneRoot)}/Subcrates`;
+}
+
+/** Serato's library cache for the volume. */
+export function seratoDatabaseFile(cloneRoot: string): string {
+  return `${seratoFolder(cloneRoot)}/database V2`;
 }
 
 /** The `.crate` file for a crate: levels joined with `%%`, Serato's subcrate separator. */
