@@ -11,8 +11,7 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
 );
 
 export default function AppLoader() {
-  // Everything persistent lives here and is saved to the app database after
-  // every change.
+  // Load persistent library from storage. Survives application reloads.
   const library = useLibrary();
 
   return (
