@@ -3,7 +3,7 @@ import { FolderSync, HardDrive, Plus, Usb } from "lucide-react";
 import { Button } from "@/ui/atoms/button";
 import type { CrateNode } from "@/core/tree";
 import type { Library } from "@/lib/useLibrary";
-import { baseName, cn, describeSource, plural } from "@/lib/utils";
+import { baseName, cn, plural } from "@/lib/utils";
 import { LocationsPanel } from "./LocationsPanel";
 
 interface MainButtonsProps {
@@ -12,6 +12,8 @@ interface MainButtonsProps {
   add: () => void;
   /** The crate a new crate would go into. */
   selected?: CrateNode | null;
+  /** The selected row as a path of names, shown while no button is hovered. */
+  breadcrumb?: string;
 }
 
 /** Toolbar buttons are square-ish: the icon sits above the label. */
@@ -22,9 +24,15 @@ const TOOL_BUTTON =
  * The toolbar above the crate tree. The top row holds the actions: add a
  * crate, pick or change the source, sync every clone, add a clone, and a
  * toggle that shows the clones with their status. The row below explains
- * whichever button the pointer is over, and reports progress and problems.
+ * whichever button the pointer is over, otherwise names the selected row,
+ * and reports progress and problems.
  */
-export function MainButtons({ library, add, selected }: MainButtonsProps) {
+export function MainButtons({
+  library,
+  add,
+  selected,
+  breadcrumb,
+}: MainButtonsProps) {
   const { source, sourceStatus, clones, cloneStatus, busy, loading } = library;
   const [showLocations, setShowLocations] = useState(false);
   // The help row shows what the hovered (or focused) button would do.
@@ -50,7 +58,7 @@ export function MainButtons({ library, add, selected }: MainButtonsProps) {
     : "Add a crate at the top level.";
 
   const sourceHint = source
-    ? `Source: ${source.path}. ${describeSource(sourceStatus)}. Click to choose a different library.`
+    ? "Click to point at a different folder: tracks are found again by file name, and nothing is deleted."
     : "Choose the root folder of your music library.";
 
   const syncHint = !source
@@ -81,7 +89,8 @@ export function MainButtons({ library, add, selected }: MainButtonsProps) {
       : `${connected} of ${plural(clones.length, "clone")} connected. Click to ${showLocations ? "hide" : "show"} the list.`;
 
   const message = library.error ?? library.warning ?? progress;
-  const help = hint ?? addHint;
+  // Hovering a button explains it; otherwise the row names the selection.
+  const help = hint ?? (breadcrumb || addHint);
 
   return (
     <div className="border-b">
@@ -103,15 +112,12 @@ export function MainButtons({ library, add, selected }: MainButtonsProps) {
             variant="outline"
             size="lg"
             className={cn(TOOL_BUTTON, "max-w-56")}
-            onClick={library.addSource}
+            onClick={library.changeSource}
             disabled={busy || loading}
           >
             {source ? <HardDrive /> : <Plus />}
-            <span className="flex min-w-0 items-center gap-1.5">
-              <span className="truncate">
-                {source ? baseName(source.path) : "Add Source"}
-              </span>
-              {source && <StatusDot kind={sourceStatus?.kind} />}
+            <span className="truncate">
+              {source ? baseName(source.path) : "Add Source"}
             </span>
           </Button>
         </HintTarget>
@@ -202,19 +208,6 @@ function HintTarget({
     >
       {children}
     </span>
-  );
-}
-
-/** A small dot that shows whether the source is connected. */
-function StatusDot({ kind }: { kind: string | undefined }) {
-  const color =
-    kind === "ready"
-      ? "bg-emerald-500"
-      : kind === "scanning"
-        ? "bg-amber-500"
-        : "bg-destructive";
-  return (
-    <span aria-hidden className={`size-2 shrink-0 rounded-full ${color}`} />
   );
 }
 

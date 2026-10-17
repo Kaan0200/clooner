@@ -1,12 +1,20 @@
-import type { TrackIssue } from "@/core/issues";
+import type { IssueKind, TrackIssue } from "@/core/issues";
+
+/** Red when an edit may be lost or a file is gone, amber for a duplicate, blue for a track shared between crates. */
+const COLORS: Record<IssueKind, string> = {
+  sync: "bg-destructive",
+  notFound: "bg-destructive",
+  duplicate: "bg-amber-500",
+  shared: "bg-sky-500",
+};
 
 /**
- * The dot on a track row. Red for a sync conflict, since an edit may have
- * been lost; amber for a duplicate. Hovering it explains every issue.
+ * The dot on a track row. Its colour is that of the first (most serious)
+ * issue. Hovering it explains every issue.
  */
 export function IssueDot({ issues }: { issues: TrackIssue[] }) {
   const detail = issues.map((i) => i.detail).join("\n\n");
-  const color = issues[0].kind === "sync" ? "bg-destructive" : "bg-amber-500";
+  const color = COLORS[issues[0].kind];
   return (
     <span
       role="img"

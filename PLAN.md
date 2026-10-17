@@ -50,14 +50,30 @@ Applies to `Tracks/` paths and to `Crates/` folder and stub names. Track paths i
 
 - **Any two locations can sync.** There is no fixed parent and child.
 - **Each location's database stores the last-synced state for each peer location.** This is the base for three-way comparison.
-- **Track identity:** the path relative to the root, plus size, modified time and hash.
-  - A rename shows up as "missing + new". The app relinks the two automatically when the hashes match.
-  - A rename combined with a retag can't be matched, so it gets flagged.
+- **Track identity is the file name** (ignoring case and extension). File names don't change; folders do.
+  - A track that isn't where its path says is looked for by name under the root on every scan, and relinked when exactly one file has that name. Several files with the name are narrowed by the old relative place, then extension, then parent folder name; a tie that remains is flagged, as is a name found nowhere (`src/core/relink.ts`).
+  - A renamed file is therefore a new track; the old entry is flagged as not found.
+  - Clones do the same on sync: a track whose place in `Tracks/` is empty but whose name sits elsewhere under it is renamed into place, never copied again.
 - **Files:** if only one side changed since the last sync, copy that side's file over the other. If both changed, raise a conflict. Tags are never merged.
 - **Crates:** merge membership. Tracks added on either side are kept, and tracks removed on either side are removed. A crate renamed or deleted on one side and edited on the other is a conflict.
 - **Selection:** each clone picks individual crates from any collection, and its database lists them. SOURCE always has every crate.
   - A three-state checkbox shows all, some or none of a crate's subtree. A fully checked crate includes its future subcrates. A partly checked crate includes only the subcrates picked.
   - If a subcrate is picked but its parent isn't, the parent is written as an empty crate so the tree looks right in Serato.
+
+## Moving the library
+
+- **Change Source** never deletes or copies anything. It picks a new root, scans it, matches every crate member by file name, and asks before changing anything: how many tracks stay, how many were relinked, how many are ambiguous or not found.
+- Pointing the root one folder up or down, moving the library to another drive, or moving tracks between folders all relink without the user doing anything. Tracks that can't be placed keep their old path and show a dot until the file is put back and the library rescanned, or the track is removed from the crate.
+- Clones follow at their next sync by renaming files into their new places. Serato's own database on the clone keeps stale records for the old paths; cleaning those is still to do, as is removing orphaned files from a clone's `Tracks/`.
+
+## Track dots
+
+A track row shows a dot for anything that wants a decision, with a tooltip explaining every issue (`src/core/issues.ts`):
+
+- **Sync conflict** (red): edited on both the source and a clone between syncs; the newer copy won.
+- **Not found** (red): no file with its name under the root, or several and none could be chosen.
+- **Duplicate** (amber): a different file whose title wholly contains, or is wholly contained in, this one's, on word boundaries. "Super Song" and "Super Song (Remix)" are duplicates; "Super Song Version 1" and "Version 2" are not, and neither are "Song" and "Songbird".
+- **Shared** (blue): the same file in two crates where neither is inside the other. A track in a crate and in its subcrate is scoping, not sharing.
 
 ## Adding tracks
 

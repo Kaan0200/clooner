@@ -8,6 +8,8 @@ export interface ScanResult {
   tracks: number;
   /** Every folder below the root, as "/"-separated paths relative to it. */
   folders: string[];
+  /** Every audio file below the root, as "/"-separated paths relative to it. */
+  files: string[];
 }
 
 export interface CloneResult {
@@ -66,7 +68,7 @@ export async function pickFolder(title: string): Promise<string | null> {
  * crates, not tracks.
  */
 export async function scanLibrary(root: string): Promise<ScanResult> {
-  const result: ScanResult = { tracks: 0, folders: [] };
+  const result: ScanResult = { tracks: 0, folders: [], files: [] };
   const pending = [""];
 
   while (pending.length > 0) {
@@ -80,11 +82,13 @@ export async function scanLibrary(root: string): Promise<ScanResult> {
         pending.push(child);
       } else if (entry.isFile && isAudioFile(entry.name)) {
         result.tracks += 1;
+        result.files.push(rel ? `${rel}/${entry.name}` : entry.name);
       }
     }
   }
 
   result.folders.sort();
+  result.files.sort();
   return result;
 }
 

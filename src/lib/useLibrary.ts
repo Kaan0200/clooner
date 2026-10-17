@@ -6,8 +6,12 @@
 // present, progress while folders are being created or a sync is running.
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { confirm } from "@tauri-apps/plugin-dialog";
 import { exists } from "@tauri-apps/plugin-fs";
+import { normalizeRoot } from "@/core/clone";
 import { emptyDb, type AppDb, type CloneEntry, type SourceEntry } from "@/core/db";
+import type { Unresolved } from "@/core/issues";
+import { buildIndex, movedPath, relinkTree, remapDurations, type RelinkPlan } from "@/core/relink";
 import type { CrateTree } from "@/core/tree";
 import {
   attachClone,
@@ -18,10 +22,21 @@ import {
 } from "@/lib/library";
 import { loadDb, saveDb } from "@/lib/store";
 import { copyTracks, syncClone as runSync, type CopySummary, type SyncSummary } from "@/lib/sync";
+import { allTrackPaths, describeRelink } from "@/lib/utils";
+
+/** How the crate members fared against the last scan of the source. */
+export interface RelinkSummary {
+  /** Tracks whose paths were rewritten because their files had moved. */
+  moved: number;
+  ambiguous: number;
+  notFound: number;
+  /** The ambiguous and not-found tracks, for the dots on their rows. */
+  unresolved: Unresolved;
+}
 
 export type SourceStatus =
   | { kind: "scanning" }
-  | { kind: "ready"; scan: ScanResult }
+  | { kind: "ready"; scan: ScanResult; relink: RelinkSummary }
   | { kind: "missing" }
   | { kind: "error"; message: string };
 
@@ -55,6 +70,8 @@ export interface Library {
   busy: boolean;
   source: SourceEntry | null;
   sourceStatus: SourceStatus | null;
+  /** Tracks the last scan couldn't find, keyed by track key. Empty until scanned. */
+  unresolved: Unresolved;
   clones: CloneEntry[];
   cloneStatus: Record<string, CloneStatus>;
   crates: CrateTree;
@@ -63,8 +80,12 @@ export interface Library {
   durations: Record<string, number>;
   /** Records freshly read track lengths. */
   setDurations: (updates: Record<string, number>) => void;
-  /** Picks a library root. Replaces the current source and re-attaches clones to it. */
-  addSource: () => Promise<void>;
+  /**
+   * Picks a library root. With a source already set, the crate members are
+   * matched by file name against the new root and the user confirms the
+   * outcome before anything changes. Nothing on disk is touched.
+   */
+  changeSource: () => Promise<void>;
   /** Picks a folder and makes it a clone, or re-attaches an existing one. */
   addClone: () => Promise<void>;
   /** Forgets a clone. Nothing on disk is touched. */
@@ -112,22 +133,50 @@ export function useLibrary(): Library {
     });
   }, []);
 
-  /** Scans the source and records the outcome. Resolves to the scan when usable. */
-  const refreshSource = useCallback(async (path: string): Promise<ScanResult | null> => {
-    setSourceStatus({ kind: "scanning" });
-    try {
-      if (!(await exists(path))) {
-        setSourceStatus({ kind: "missing" });
+  /**
+   * Matches every crate member against a scan of the source and rewrites
+   * the paths of those whose files moved, carrying their lengths and
+   * conflict notes along. `oldRoot` is where the library was, when it has
+   * just moved, to break ties by relative place.
+   */
+  const applyRelink = useCallback(
+    (root: string, scan: ScanResult, oldRoot: string | null): RelinkSummary => {
+      const current = dbRef.current ?? emptyDb();
+      const plan = relinkTree(root, current.crates, buildIndex(scan.files), oldRoot);
+      if (plan.moves.size > 0) update((d) => applyPlan(d, plan));
+      return {
+        moved: plan.moved,
+        ambiguous: plan.ambiguous,
+        notFound: plan.notFound,
+        unresolved: plan.unresolved,
+      };
+    },
+    [update],
+  );
+
+  /**
+   * Scans the source (or takes a scan already made) and records the
+   * outcome, relinking moved tracks. Resolves to the scan when usable.
+   */
+  const refreshSource = useCallback(
+    async (path: string, scan?: ScanResult, oldRoot: string | null = null): Promise<ScanResult | null> => {
+      setSourceStatus({ kind: "scanning" });
+      try {
+        if (!(await exists(path))) {
+          setSourceStatus({ kind: "missing" });
+          return null;
+        }
+        scan ??= await scanLibrary(path);
+        const relink = applyRelink(path, scan, oldRoot);
+        setSourceStatus({ kind: "ready", scan, relink });
+        return scan;
+      } catch (e) {
+        setSourceStatus({ kind: "error", message: message(e) });
         return null;
       }
-      const scan = await scanLibrary(path);
-      setSourceStatus({ kind: "ready", scan });
-      return scan;
-    } catch (e) {
-      setSourceStatus({ kind: "error", message: message(e) });
-      return null;
-    }
-  }, []);
+    },
+    [applyRelink],
+  );
 
   /** Attaches one clone, reporting progress, and records its id. Throws on failure. */
   const attachOne = useCallback(
@@ -166,14 +215,14 @@ export function useLibrary(): Library {
   );
 
   const refreshAll = useCallback(
-    async (current: AppDb) => {
+    async (current: AppDb, scan?: ScanResult, oldRoot: string | null = null) => {
       if (!current.source) {
         setSourceStatus(null);
         setCloneStatus({});
         return;
       }
       setCloneStatus(Object.fromEntries(current.clones.map((c) => [c.path, { kind: "waiting" }])));
-      const scan = await refreshSource(current.source.path);
+      scan = (await refreshSource(current.source.path, scan, oldRoot)) ?? undefined;
       if (!scan) return;
       const sourcePath = current.source.path;
       await Promise.all(current.clones.map((c) => refreshClone(sourcePath, c, scan)));
@@ -207,15 +256,50 @@ export function useLibrary(): Library {
     [update],
   );
 
-  const addSource = useCallback(async () => {
+  const changeSource = useCallback(async () => {
     setError(null);
-    const path = await pickFolder("Choose the root folder of your music library");
+    const current = dbRef.current ?? emptyDb();
+    const previous = current.source?.path ?? null;
+    const path = await pickFolder(
+      previous ? "Choose the new root folder of your music library" : "Choose the root folder of your music library",
+    );
     if (!path) return;
 
     setBusy(true);
     try {
+      // The same folder again is just a rescan.
+      if (previous && sameRoot(previous, path)) {
+        await refreshAll(current);
+        return;
+      }
+
+      // With crates to carry over, show where their tracks will end up and
+      // let the user back out before anything is written.
+      let scan: ScanResult | undefined;
+      if (previous && allTrackPaths(current.crates).length > 0) {
+        setSourceStatus({ kind: "scanning" });
+        try {
+          scan = await scanLibrary(path);
+        } catch (e) {
+          setError(`Couldn't read ${path}: ${message(e)}`);
+          await refreshAll(current);
+          return;
+        }
+        const plan = relinkTree(path, current.crates, buildIndex(scan.files), previous);
+        const ok = await confirm(describeRelink(previous, path, plan), {
+          title: "Change source",
+          kind: plan.ambiguous + plan.notFound > 0 ? "warning" : "info",
+          okLabel: "Change source",
+          cancelLabel: "Keep current",
+        });
+        if (!ok) {
+          await refreshAll(current);
+          return;
+        }
+      }
+
       update((d) => ({ ...d, source: { path, added: new Date().toISOString() } }));
-      await refreshAll(dbRef.current!);
+      await refreshAll(dbRef.current!, scan, previous);
     } finally {
       setBusy(false);
     }
@@ -359,6 +443,8 @@ export function useLibrary(): Library {
     if (dbRef.current) await refreshAll(dbRef.current);
   }, [refreshAll]);
 
+  const unresolved = sourceStatus?.kind === "ready" ? sourceStatus.relink.unresolved : EMPTY_UNRESOLVED;
+
   return {
     loading: db === null,
     warning,
@@ -366,13 +452,14 @@ export function useLibrary(): Library {
     busy,
     source: db?.source ?? null,
     sourceStatus,
+    unresolved,
     clones: db?.clones ?? [],
     cloneStatus,
     crates: db?.crates ?? [],
     setCrates,
     durations: db?.durations ?? EMPTY_DURATIONS,
     setDurations,
-    addSource,
+    changeSource,
     addClone,
     removeClone,
     syncClone,
@@ -382,8 +469,26 @@ export function useLibrary(): Library {
   };
 }
 
-/** A stable empty map, so consumers don't see a new object every render. */
+/** Stable empty values, so consumers don't see a new object every render. */
 const EMPTY_DURATIONS: Record<string, number> = {};
+const EMPTY_UNRESOLVED: Unresolved = new Map();
+
+function sameRoot(a: string, b: string): boolean {
+  return normalizeRoot(a).toLowerCase() === normalizeRoot(b).toLowerCase();
+}
+
+/** The database with a relink plan's moves written through every place a path is kept. */
+function applyPlan(db: AppDb, plan: RelinkPlan): AppDb {
+  return {
+    ...db,
+    crates: plan.tree,
+    durations: remapDurations(db.durations, plan.moves),
+    clones: db.clones.map((c) => ({
+      ...c,
+      conflicts: c.conflicts.map((k) => ({ ...k, path: movedPath(k.path, plan.moves) })),
+    })),
+  };
+}
 
 function message(e: unknown): string {
   return e instanceof Error ? e.message : String(e);

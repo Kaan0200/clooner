@@ -12,6 +12,10 @@
 //
 // Every copy records both sides' size and modification time in the clone's
 // `clooner.json`, so the next sync can tell which side actually changed.
+//
+// Files follow moves without being copied again: when a track's place in
+// the clone is empty but a file with its name sits elsewhere under
+// `Tracks/`, it is renamed into place first (see core/relink.ts).
 
 import { copyFile, exists, mkdir, readFile, rename, stat, writeFile } from "@tauri-apps/plugin-fs";
 import { encodeCrate, newCrate } from "@/core/crate";
@@ -22,6 +26,9 @@ import {
   newDatabase,
   type TrackInfo,
 } from "@/core/database";
+import { normalizeRoot } from "@/core/clone";
+import { decodePath, encodePath } from "@/core/names";
+import { buildIndex, matchTrack } from "@/core/relink";
 import {
   decideSync,
   needsCopy,
@@ -40,6 +47,7 @@ import {
   cloneMarker,
   forEachConcurrent,
   readCloneDb,
+  scanLibrary,
   writeCloneDb,
   type CloneDb,
 } from "@/lib/library";
@@ -112,6 +120,8 @@ export interface SyncConflict {
 }
 
 export interface SyncSummary {
+  /** Files renamed into place inside the clone because they had moved in the library. */
+  relinked: number;
   /** Files copied from the source into the clone. */
   toClone: number;
   /** Files copied from the clone back into the source. */
@@ -156,6 +166,7 @@ export async function syncClone(
   const jobs = planCrates(sourceRoot, cloneRoot, crates);
   const synced = syncRecords(db);
   const summary: SyncSummary = {
+    relinked: 0,
     toClone: 0,
     toSource: 0,
     unchanged: 0,
@@ -179,6 +190,32 @@ export async function syncClone(
     }
   }
   const tracks = [...unique.values()];
+
+  // Files the clone already holds, by name, so a track that moved in the
+  // library is renamed to its new place rather than copied again. A file
+  // that another member expects where it is, or whose twin still exists at
+  // the source, belongs to that other track and stays put.
+  onProgress("Looking for moved files in the clone…");
+  const tracksRoot = `${normalizeRoot(cloneRoot)}/Tracks`;
+  const cloneIndex = buildIndex((await scanLibrary(tracksRoot)).files);
+  const expected = new Set(tracks.map((t) => encodePath(t.relative).toLowerCase()));
+  const relinkInClone = async (track: TrackJob): Promise<boolean> => {
+    const match = matchTrack(tracksRoot, track.clonePath, cloneIndex, null, expected);
+    if (match.kind !== "moved") return false;
+    const wasAt = decodePath(normalizeRoot(match.to).slice(tracksRoot.length + 1));
+    if (await exists(`${normalizeRoot(sourceRoot)}/${wasAt}`)) return false;
+    try {
+      await mkdir(parentOf(track.clonePath), { recursive: true });
+      await rename(match.to, track.clonePath);
+    } catch {
+      // Another track may have claimed the file first; a copy will follow.
+      return false;
+    }
+    if (synced[wasAt] && !synced[track.relative]) synced[track.relative] = synced[wasAt];
+    delete synced[wasAt];
+    return true;
+  };
+
   /** Tracks that exist in the clone after this pass, for the Serato database. */
   const present: TrackInfo[] = [];
   let started = 0;
@@ -187,6 +224,7 @@ export async function syncClone(
     onProgress(
       `Checking ${started.toLocaleString()} / ${tracks.length.toLocaleString()}: ${fileName(track.source)}`,
     );
+    if (await relinkInClone(track)) summary.relinked += 1;
     const [source, clone] = await Promise.all([
       fileState(track.source),
       fileState(track.clonePath),

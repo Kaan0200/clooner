@@ -12,9 +12,10 @@ import {
   type CrateTree,
   type TreeRow,
 } from "@/core/tree";
+import type { RelinkPlan } from "@/core/relink";
 import type { CloneResult } from "@/lib/library";
 import type { CopySummary, SyncSummary } from "@/lib/sync";
-import type { CloneStatus, SourceStatus } from "@/lib/useLibrary";
+import type { CloneStatus, RelinkSummary, SourceStatus } from "@/lib/useLibrary";
 
 export { cn } from "cn";
 
@@ -177,7 +178,9 @@ export function describeSource(status: SourceStatus | null): string {
   switch (status?.kind) {
     case "ready": {
       const { tracks, folders } = status.scan;
-      return `${tracks.toLocaleString()} tracks in ${folders.length.toLocaleString()} folders`;
+      const parts = [`${tracks.toLocaleString()} tracks in ${folders.length.toLocaleString()} folders`];
+      parts.push(...describeRelinkCounts(status.relink));
+      return parts.join(", ");
     }
     case "missing":
       return "Not connected: the folder isn't there right now";
@@ -186,6 +189,32 @@ export function describeSource(status: SourceStatus | null): string {
     default:
       return "Scanning…";
   }
+}
+
+/** The parts of a relink worth mentioning after a scan; empty when every track was in place. */
+function describeRelinkCounts(relink: RelinkSummary): string[] {
+  const parts: string[] = [];
+  if (relink.moved) parts.push(`${plural(relink.moved, "track")} relinked after moving`);
+  if (relink.ambiguous) parts.push(`${relink.ambiguous.toLocaleString()} with several files of the same name`);
+  if (relink.notFound) parts.push(`${relink.notFound.toLocaleString()} not found`);
+  return parts;
+}
+
+/**
+ * The question asked before the source changes: where the crates' tracks
+ * will end up under the new root.
+ */
+export function describeRelink(from: string, to: string, plan: RelinkPlan): string {
+  const lines = [`Change the source from\n${from}\nto\n${to}?`, ""];
+  lines.push("Tracks are matched by file name. Nothing is copied, moved or deleted.", "");
+  lines.push(`${plural(plan.kept, "track")} stay where they are.`);
+  if (plan.moved) lines.push(`${plural(plan.moved, "track")} were found at a new place and will be relinked.`);
+  if (plan.ambiguous)
+    lines.push(
+      `${plural(plan.ambiguous, "track")} have several files with their name and will be flagged.`,
+    );
+  if (plan.notFound) lines.push(`${plural(plan.notFound, "track")} weren't found and will be flagged.`);
+  return lines.join("\n");
 }
 
 export function describeClone(
@@ -231,6 +260,7 @@ function describeSync(s: SyncSummary): string {
     );
   if (s.databaseError)
     parts.push(`Serato database left alone (${s.databaseError})`);
+  if (s.relinked) parts.push(`${s.relinked.toLocaleString()} moved into place`);
   if (s.toClone) parts.push(`${s.toClone.toLocaleString()} copied to clone`);
   if (s.toSource)
     parts.push(`${s.toSource.toLocaleString()} copied back to source`);

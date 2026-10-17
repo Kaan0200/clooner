@@ -3,7 +3,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import { ScrollArea } from "@/ui/atoms/scroll-area";
 import { durationKey } from "@/core/duration";
-import { trackIssues } from "@/core/issues";
+import { issuesFor, trackIssues } from "@/core/issues";
 import { titleOf } from "@/core/m3u";
 import {
   addCrate,
@@ -18,7 +18,6 @@ import {
   removeTrack,
   renameCrate,
   rowKey,
-  trackKey,
   visibleRows,
   type CrateNode,
   type TreeRow,
@@ -39,6 +38,7 @@ import {
 import { CrateRow } from "./CrateRow";
 import { DragGhost } from "./DragGhost";
 import { MainButtons } from "./MainButtons";
+import { SourceDot } from "./SourceDot";
 import { TrackRow } from "./TrackRow";
 
 interface Props {
@@ -79,10 +79,11 @@ export default function App({ library }: Props) {
     library.durations,
     library.setDurations,
   );
-  // Sync conflicts and duplicates, recomputed only when the crates or clones change.
+  // Sync conflicts, tracks not found, duplicates and shared tracks,
+  // recomputed only when the crates, clones or last scan change.
   const issues = useMemo(
-    () => trackIssues(tree, library.clones),
-    [tree, library.clones],
+    () => trackIssues(tree, library.clones, library.unresolved),
+    [tree, library.clones, library.unresolved],
   );
 
   // A selection can go stale if the tree changes underneath it. The crate a
@@ -488,7 +489,12 @@ export default function App({ library }: Props) {
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <MainButtons library={library} add={add} selected={selected} />
+      <MainButtons
+        library={library}
+        add={add}
+        selected={selected}
+        breadcrumb={breadcrumb}
+      />
 
       <ScrollArea className="min-h-0 flex-1">
         {rows.length === 0 ? (
@@ -532,7 +538,7 @@ export default function App({ library }: Props) {
                     dragging={fileDragging}
                     beingDragged={beingDragged}
                     duration={known[durationKey(row.path)]}
-                    issues={issues.get(trackKey(row.path))}
+                    issues={issuesFor(issues, row.crateId, row.path)}
                     onSelect={() => select(key)}
                     onPointerDown={(e) => startDrag(row, e)}
                   />
@@ -576,20 +582,23 @@ export default function App({ library }: Props) {
         )}
       </ScrollArea>
 
-      {(notice || breadcrumb.includes(" / ")) && (
-        <footer className="flex items-center justify-between gap-3 border-t px-3 py-1.5 text-xs text-muted-foreground">
-          <span className="truncate">{breadcrumb}</span>
-          {notice && (
-            <span
-              role="status"
-              className="min-w-0 truncate text-foreground"
-              title={notice}
-            >
-              {notice}
-            </span>
+      {/* Left: whether the source is connected. The selected row is named in the toolbar's help row. */}
+      <footer className="flex min-h-7 items-center justify-between gap-3 border-t px-3 py-1.5 text-xs text-muted-foreground">
+        <span className="flex items-center">
+          {library.source && (
+            <SourceDot source={library.source} status={library.sourceStatus} />
           )}
-        </footer>
-      )}
+        </span>
+        {notice && (
+          <span
+            role="status"
+            className="min-w-0 truncate text-foreground"
+            title={notice}
+          >
+            {notice}
+          </span>
+        )}
+      </footer>
 
       {activeDrag && (
         <DragGhost drag={activeDrag} allowed={dragAllowed} tree={tree} />
