@@ -71,6 +71,8 @@ export interface Library {
   removeClone: (path: string) => void;
   /** Writes the current crate contents as Serato crate files into the clone. */
   syncClone: (path: string) => Promise<void>;
+  /** Syncs every clone that is connected right now, one after another. */
+  syncAll: () => Promise<void>;
   /**
    * Copies tracks into every connected clone, right away. Resolves to how
    * many clones received them and how many files were actually copied.
@@ -295,6 +297,18 @@ export function useLibrary(): Library {
     [setClone, update],
   );
 
+  const syncAll = useCallback(async () => {
+    const current = dbRef.current;
+    if (!current?.source) return;
+    // One at a time: each sync reads the source and writes the clone, and
+    // two running at once would only fight over the disk.
+    for (const clone of current.clones) {
+      if (cloneStatusRef.current[clone.path]?.kind === "ready") {
+        await syncClone(clone.path);
+      }
+    }
+  }, [syncClone]);
+
   const copyToClones = useCallback(
     async (paths: string[]) => {
       const current = dbRef.current;
@@ -362,6 +376,7 @@ export function useLibrary(): Library {
     addClone,
     removeClone,
     syncClone,
+    syncAll,
     copyToClones,
     rescan,
   };
