@@ -1,8 +1,17 @@
 import { open } from "@tauri-apps/plugin-dialog";
-import { exists, mkdir, readDir, readTextFile, stat, writeTextFile } from "@tauri-apps/plugin-fs";
+import { exists, mkdir, readDir, readTextFile, stat } from "@tauri-apps/plugin-fs";
 import { isAudioFile } from "@/core/audio";
 import { cloneFolders, isInside, leafFolders, normalizeRoot } from "@/core/clone";
-import type { SyncRecord } from "@/core/sync";
+import {
+  MANIFEST_VERSION,
+  manifestPath,
+  parseManifest,
+  serializeManifest,
+  type Manifest,
+  type Peer,
+} from "@/core/manifest";
+import { baseName } from "@/core/paths";
+import { writeTextAtomic } from "@/lib/store";
 
 export interface ScanResult {
   tracks: number;
@@ -13,42 +22,16 @@ export interface ScanResult {
 }
 
 export interface CloneResult {
-  /** The clone's id from its `clooner.json`. */
+  /** The clone's location id. */
   id: string;
+  /** What the clone is called. */
+  name: string;
   /** True when the folder was already a clooner clone and has been re-attached. */
   existing: boolean;
   /** Folders now present in the clone, including any created on this pass. */
   folders: number;
   /** Audio files found under the clone's `Tracks/`. */
   tracks: number;
-}
-
-/** The `clooner.json` marker at the root of a clone. */
-export interface CloneDb {
-  version: number;
-  kind: "clone";
-  id: string;
-  created: string;
-  source: { path: string };
-  /** When the clone was last opened by the app, as ISO 8601. */
-  attached?: string;
-  /** When the clone was last synced, as ISO 8601. */
-  lastSync?: string;
-  /**
-   * Both sides of each copied track as of its last copy, keyed by its
-   * source-relative path. Older markers hold only the source state here;
-   * `syncRecords` in lib/sync.ts normalizes them.
-   */
-  synced?: Record<string, SyncRecord | SyncRecord["source"]>;
-}
-
-/** The marker file's path for a clone root. */
-export function cloneMarker(cloneRoot: string): string {
-  return `${normalizeRoot(cloneRoot)}/clooner.json`;
-}
-
-export async function writeCloneDb(cloneRoot: string, db: CloneDb): Promise<void> {
-  await writeTextFile(cloneMarker(cloneRoot), JSON.stringify(db, null, 2) + "\n");
 }
 
 /** Opens the OS folder picker. Resolves to null when the user cancels. */
@@ -60,6 +43,22 @@ export async function pickFolder(title: string): Promise<string | null> {
     title,
   });
   return typeof picked === "string" ? picked : null;
+}
+
+/**
+ * Reads the manifest at a location root. Resolves to null when there is
+ * none. Throws when the file exists but isn't a clooner manifest, so an
+ * unrelated `clooner.json` is never overwritten.
+ */
+export async function readManifestAt(root: string): Promise<Manifest | null> {
+  const path = manifestPath(root);
+  if (!(await exists(path))) return null;
+  return parseManifest(await readTextFile(path));
+}
+
+/** Writes a location's manifest, atomically and coalesced. */
+export function writeManifestAt(root: string, manifest: Manifest): Promise<void> {
+  return writeTextAtomic(manifestPath(root), serializeManifest(manifest));
 }
 
 /**
@@ -93,13 +92,15 @@ export async function scanLibrary(root: string): Promise<ScanResult> {
 }
 
 /**
- * Makes `cloneRoot` a managed clone of `sourceRoot`, or re-attaches it when
- * it already is one. Either way the `Tracks/` tree is brought up to date with
- * the source's folders (creating a folder that exists is a no-op), `Crates/`
- * is ensured, the clone's own tracks are counted, and the `clooner.json`
- * marker is written. No track files are copied yet.
+ * Makes `cloneRoot` a clone of the library described by `source`, or
+ * re-attaches it when it already is one. Either way the `Tracks/` tree is
+ * brought up to date with the source's folders (creating a folder that
+ * exists is a no-op), `Crates/` is ensured, the clone's own tracks are
+ * counted, and the clone's manifest is written with the source's crates and
+ * revision and the source as a peer. No track files are copied yet.
  */
 export async function attachClone(
+  source: Manifest,
   sourceRoot: string,
   cloneRoot: string,
   scan: ScanResult,
@@ -111,8 +112,15 @@ export async function attachClone(
   if (isInside(cloneRoot, sourceRoot)) {
     throw new Error("A clone cannot contain the source library.");
   }
-  const marker = `${cloneRoot}/clooner.json`;
-  const previous = await readCloneDb(marker);
+  const previous = await readManifestAt(cloneRoot);
+  if (previous?.kind === "source") {
+    throw new Error("That folder is a source library, not a clone.");
+  }
+  if (previous?.libraryId && source.libraryId && previous.libraryId !== source.libraryId) {
+    throw new Error(
+      `That folder is a clone of a different library${previous.name ? ` ("${previous.name}")` : ""}.`,
+    );
+  }
 
   // Only the deepest folders need an explicit mkdir; recursive creation
   // fills in their ancestors. Calls run concurrently because each one is an
@@ -128,41 +136,36 @@ export async function attachClone(
   const tracks = previous ? (await scanLibrary(`${cloneRoot}/Tracks`)).tracks : 0;
 
   const now = new Date().toISOString();
-  const db: CloneDb = previous
-    ? { ...previous, source: { path: normalizeRoot(sourceRoot) }, attached: now }
-    : {
-        version: 1,
-        kind: "clone",
-        id: crypto.randomUUID(),
-        created: now,
-        source: { path: normalizeRoot(sourceRoot) },
-        attached: now,
-      };
-  await writeTextFile(marker, JSON.stringify(db, null, 2) + "\n");
+  const known = previous?.peers[source.locationId];
+  const sourcePeer: Peer = {
+    name: source.name,
+    kind: "source",
+    revision: known?.revision ?? 0,
+    lastSync: known?.lastSync ?? null,
+    path: normalizeRoot(sourceRoot),
+  };
+  const manifest: Manifest = {
+    version: MANIFEST_VERSION,
+    kind: "clone",
+    libraryId: source.libraryId,
+    locationId: previous?.locationId ?? crypto.randomUUID(),
+    name: previous?.name || baseName(cloneRoot),
+    created: previous?.created ?? now,
+    revision: source.revision,
+    crates: source.crates,
+    tracks: source.tracks,
+    peers: { ...(previous?.peers ?? {}), [source.locationId]: sourcePeer },
+    synced: previous?.synced ?? {},
+  };
+  await writeManifestAt(cloneRoot, manifest);
 
-  return { id: db.id, existing: previous !== null, folders: scan.folders.length + 2, tracks };
-}
-
-/**
- * Reads a clone's marker. Resolves to null when there is none. Throws when
- * the file exists but isn't a clooner clone, so an unrelated `clooner.json`
- * is never overwritten.
- */
-export async function readCloneDb(marker: string): Promise<CloneDb | null> {
-  if (!(await exists(marker))) return null;
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(await readTextFile(marker));
-  } catch {
-    throw new Error("That folder has a clooner.json that can't be read.");
-  }
-
-  const db = parsed as Partial<CloneDb> | null;
-  if (!db || typeof db !== "object" || db.kind !== "clone" || typeof db.id !== "string") {
-    throw new Error("That folder's clooner.json isn't a clone.");
-  }
-  return db as CloneDb;
+  return {
+    id: manifest.locationId,
+    name: manifest.name,
+    existing: previous !== null,
+    folders: scan.folders.length + 2,
+    tracks,
+  };
 }
 
 /**
@@ -205,10 +208,6 @@ async function scanLibraryFiles(root: string): Promise<string[]> {
     }
   }
   return files.sort();
-}
-
-function baseName(path: string): string {
-  return path.slice(Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\")) + 1);
 }
 
 export async function forEachConcurrent<T>(

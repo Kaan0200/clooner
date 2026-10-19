@@ -1,22 +1,30 @@
 // The app's persisted state and the actions that change it, as a hook.
 //
-// The database (source, clones, crates) is loaded once at startup and saved
-// after every change. Alongside it lives transient status that is never
-// saved: whether the source has been scanned, whether each clone's folder is
+// The database (where the source is, which clones are known, and a copy of
+// the library manifest) is loaded once at startup and saved after every
+// change. The manifest at the source root is the truth for the library:
+// when the root is reachable, the copy here is read from it or written back
+// to it; when the root is away, crate edits are kept here and written at the
+// next chance. Alongside lives transient status that is never saved:
+// whether the source has been scanned, whether each clone's folder is
 // present, progress while folders are being created or a sync is running.
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import { exists } from "@tauri-apps/plugin-fs";
 import { normalizeRoot } from "@/core/clone";
 import { emptyDb, type AppDb, type CloneEntry, type SourceEntry } from "@/core/db";
 import type { Unresolved } from "@/core/issues";
-import { buildIndex, movedPath, relinkTree, remapDurations, type RelinkPlan } from "@/core/relink";
+import { newSourceManifest, type Manifest } from "@/core/manifest";
+import { baseName } from "@/core/paths";
+import { buildIndex, movedPath, relinkTree, remapKeys, type RelinkPlan } from "@/core/relink";
 import type { CrateTree } from "@/core/tree";
 import {
   attachClone,
   pickFolder,
+  readManifestAt,
   scanLibrary,
+  writeManifestAt,
   type CloneResult,
   type ScanResult,
 } from "@/lib/library";
@@ -70,20 +78,25 @@ export interface Library {
   busy: boolean;
   source: SourceEntry | null;
   sourceStatus: SourceStatus | null;
+  /** The library: its name, ids, revision and crates. Null until there are crates or a source. */
+  library: Manifest | null;
+  /** True while crate changes are waiting to be written to the source root. */
+  dirty: boolean;
   /** Tracks the last scan couldn't find, keyed by track key. Empty until scanned. */
   unresolved: Unresolved;
   clones: CloneEntry[];
   cloneStatus: Record<string, CloneStatus>;
   crates: CrateTree;
   setCrates: (tree: CrateTree) => void;
-  /** Known track lengths in seconds, keyed as in core/duration.ts. */
+  /** Known track lengths in seconds, keyed by track key. */
   durations: Record<string, number>;
-  /** Records freshly read track lengths. */
+  /** Records freshly read track lengths, keyed by track key. */
   setDurations: (updates: Record<string, number>) => void;
   /**
-   * Picks a library root. With a source already set, the crate members are
-   * matched by file name against the new root and the user confirms the
-   * outcome before anything changes. Nothing on disk is touched.
+   * Picks a library root. A root that already holds a library opens it.
+   * Otherwise, with a source already set, the crate members are matched by
+   * file name against the new root and the user confirms the outcome before
+   * anything changes. No track files are touched.
    */
   changeSource: () => Promise<void>;
   /** Picks a folder and makes it a clone, or re-attaches an existing one. */
@@ -95,8 +108,9 @@ export interface Library {
   /** Syncs every clone that is connected right now, one after another. */
   syncAll: () => Promise<void>;
   /**
-   * Copies tracks into every connected clone, right away. Resolves to how
-   * many clones received them and how many files were actually copied.
+   * Copies tracks (tree paths) into every connected clone, right away.
+   * Resolves to how many clones received them and how many files were
+   * actually copied.
    */
   copyToClones: (paths: string[]) => Promise<{ clones: number; copied: number }>;
   /** Rescans the source and re-attaches every clone. */
@@ -116,6 +130,11 @@ export function useLibrary(): Library {
   const dbRef = useRef<AppDb | null>(null);
   const cloneStatusRef = useRef(cloneStatus);
   cloneStatusRef.current = cloneStatus;
+  /**
+   * True once the manifest at the source root has been read or written this
+   * session and found to be ours, so later changes can go straight to it.
+   */
+  const rootWritable = useRef(false);
 
   const update = useCallback((fn: (db: AppDb) => AppDb) => {
     const next = fn(dbRef.current ?? emptyDb());
@@ -123,6 +142,37 @@ export function useLibrary(): Library {
     setDb(next);
     saveDb(next).catch((e) => setError(`Couldn't save the database: ${message(e)}`));
   }, []);
+
+  /**
+   * Writes the library to the source root when it has unwritten changes and
+   * the root is known to be reachable and ours. Clears the dirty flag only
+   * if nothing changed meanwhile; a later change triggers its own write.
+   */
+  const persistLibrary = useCallback(async () => {
+    const current = dbRef.current;
+    if (!current?.source || !current.library || !current.dirty || !rootWritable.current) return;
+    const written = current.library;
+    try {
+      await writeManifestAt(current.source.path, written);
+      update((d) =>
+        d.library === written ? { ...d, dirty: false, baseRevision: written.revision } : d,
+      );
+    } catch (e) {
+      setError(`Couldn't write the library to ${current.source.path}: ${message(e)}`);
+    }
+  }, [update]);
+
+  /** Changes the library and schedules the write to the root. */
+  const editLibrary = useCallback(
+    (fn: (library: Manifest) => Manifest) => {
+      update((d) => {
+        const library = d.library ?? newSourceManifest(d.source ? baseName(d.source.path) : "");
+        return { ...d, library: fn(library), dirty: true };
+      });
+      void persistLibrary();
+    },
+    [persistLibrary, update],
+  );
 
   const setClone = useCallback((path: string, status: CloneStatus | null) => {
     setCloneStatus((prev) => {
@@ -142,14 +192,70 @@ export function useLibrary(): Library {
   const applyRelink = useCallback(
     (root: string, scan: ScanResult, oldRoot: string | null): RelinkSummary => {
       const current = dbRef.current ?? emptyDb();
-      const plan = relinkTree(root, current.crates, buildIndex(scan.files), oldRoot);
-      if (plan.moves.size > 0) update((d) => applyPlan(d, plan));
+      const crates = current.library?.crates ?? [];
+      const plan = relinkTree(root, crates, buildIndex(scan.files), oldRoot);
+      if (plan.moves.size > 0) {
+        update((d) => applyPlan(d, plan));
+        void persistLibrary();
+      }
       return {
         moved: plan.moved,
         ambiguous: plan.ambiguous,
         notFound: plan.notFound,
         unresolved: plan.unresolved,
       };
+    },
+    [persistLibrary, update],
+  );
+
+  /**
+   * Brings the copy here and the manifest at the root into line. A root
+   * with no manifest gets the library written to it (the first write, or
+   * an upgrade from a database that held the crates itself). Otherwise the
+   * root's manifest is taken, unless changes were made here while the root
+   * was away: then they are written if the root hasn't changed since, and
+   * kept here with a warning if it has. Throws when the root holds a clone
+   * or another library.
+   */
+  const adoptManifest = useCallback(
+    async (root: string): Promise<Manifest> => {
+      const found = await readManifestAt(root);
+      const current = dbRef.current ?? emptyDb();
+      const local = current.library;
+
+      if (found === null) {
+        const library = local ?? newSourceManifest(baseName(root));
+        const named = library.name ? library : { ...library, name: baseName(root) };
+        await writeManifestAt(root, named);
+        update((d) => ({ ...d, library: named, dirty: false, baseRevision: named.revision }));
+        rootWritable.current = true;
+        return named;
+      }
+      if (found.kind !== "source") {
+        throw new Error(`This folder is a clone ("${found.name}"), not a source library.`);
+      }
+      if (local && local.libraryId !== found.libraryId) {
+        throw new Error(
+          `This folder holds a different library ("${found.name}"). Use Change Source to open it.`,
+        );
+      }
+      if (!local || !current.dirty) {
+        update((d) => ({ ...d, library: found, dirty: false, baseRevision: found.revision }));
+        rootWritable.current = true;
+        return found;
+      }
+      if (found.revision === current.baseRevision) {
+        // Only this computer changed anything: write the changes through.
+        await writeManifestAt(root, local);
+        update((d) => ({ ...d, dirty: false, baseRevision: local.revision }));
+        rootWritable.current = true;
+        return local;
+      }
+      rootWritable.current = false;
+      setWarning(
+        `Crates were changed here while the source was away, and the library at ${root} changed too (now revision ${found.revision}). Your changes are kept here and will not be written until merging arrives.`,
+      );
+      return local;
     },
     [update],
   );
@@ -163,26 +269,29 @@ export function useLibrary(): Library {
       setSourceStatus({ kind: "scanning" });
       try {
         if (!(await exists(path))) {
+          rootWritable.current = false;
           setSourceStatus({ kind: "missing" });
           return null;
         }
+        await adoptManifest(path);
         scan ??= await scanLibrary(path);
         const relink = applyRelink(path, scan, oldRoot);
         setSourceStatus({ kind: "ready", scan, relink });
         return scan;
       } catch (e) {
+        rootWritable.current = false;
         setSourceStatus({ kind: "error", message: message(e) });
         return null;
       }
     },
-    [applyRelink],
+    [adoptManifest, applyRelink],
   );
 
   /** Attaches one clone, reporting progress, and records its id. Throws on failure. */
   const attachOne = useCallback(
-    async (sourcePath: string, clone: CloneEntry, scan: ScanResult): Promise<CloneResult> => {
+    async (source: Manifest, sourcePath: string, clone: CloneEntry, scan: ScanResult): Promise<CloneResult> => {
       setClone(clone.path, { kind: "attaching", progress: "Checking…" });
-      const result = await attachClone(sourcePath, clone.path, scan, (done, total) => {
+      const result = await attachClone(source, sourcePath, clone.path, scan, (done, total) => {
         const progress = `Creating folders… ${done.toLocaleString()} / ${total.toLocaleString()}`;
         setClone(clone.path, { kind: "attaching", progress });
       });
@@ -200,13 +309,13 @@ export function useLibrary(): Library {
 
   /** Re-attaches a known clone, turning failures into status rather than errors. */
   const refreshClone = useCallback(
-    async (sourcePath: string, clone: CloneEntry, scan: ScanResult) => {
+    async (source: Manifest, sourcePath: string, clone: CloneEntry, scan: ScanResult) => {
       try {
         if (!(await exists(clone.path))) {
           setClone(clone.path, { kind: "missing" });
           return;
         }
-        await attachOne(sourcePath, clone, scan);
+        await attachOne(source, sourcePath, clone, scan);
       } catch (e) {
         setClone(clone.path, { kind: "error", message: message(e) });
       }
@@ -225,7 +334,10 @@ export function useLibrary(): Library {
       scan = (await refreshSource(current.source.path, scan, oldRoot)) ?? undefined;
       if (!scan) return;
       const sourcePath = current.source.path;
-      await Promise.all(current.clones.map((c) => refreshClone(sourcePath, c, scan)));
+      const latest = dbRef.current ?? current;
+      const library = latest.library;
+      if (!library) return;
+      await Promise.all(latest.clones.map((c) => refreshClone(library, sourcePath, c, scan)));
     },
     [refreshClone, refreshSource],
   );
@@ -251,9 +363,23 @@ export function useLibrary(): Library {
     };
   }, [refreshAll]);
 
+  /** Every crate change is a new revision of the library. */
   const setCrates = useCallback(
-    (tree: CrateTree) => update((d) => ({ ...d, crates: tree })),
-    [update],
+    (tree: CrateTree) => editLibrary((lib) => ({ ...lib, crates: tree, revision: lib.revision + 1 })),
+    [editLibrary],
+  );
+
+  /** Track lengths are facts about files, not edits: they don't bump the revision. */
+  const setDurations = useCallback(
+    (updates: Record<string, number>) =>
+      editLibrary((lib) => {
+        const tracks = { ...lib.tracks };
+        for (const [key, duration] of Object.entries(updates)) {
+          tracks[key] = { ...tracks[key], duration };
+        }
+        return { ...lib, tracks };
+      }),
+    [editLibrary],
   );
 
   const changeSource = useCallback(async () => {
@@ -273,10 +399,53 @@ export function useLibrary(): Library {
         return;
       }
 
-      // With crates to carry over, show where their tracks will end up and
-      // let the user back out before anything is written.
+      let found: Manifest | null;
+      try {
+        found = await readManifestAt(path);
+      } catch (e) {
+        setError(`Couldn't read ${path}: ${message(e)}`);
+        return;
+      }
+      if (found?.kind === "clone") {
+        setError(`That folder is a clone ("${found.name}"), not a source library.`);
+        return;
+      }
+      const local = current.library;
+      const added = new Date().toISOString();
+
+      // A root that already holds a library: open it. The crates here, if
+      // they are another library's, stay in that library's own folder.
+      if (found && (!local || found.libraryId !== local.libraryId)) {
+        if (local && local.crates.length > 0) {
+          const ok = await confirm(
+            `${path}\nalready holds the library "${found.name}" (revision ${found.revision}).\n\nOpen it? The crates shown now ("${local.name || "unnamed"}") stay in their own folder and will no longer be shown here.`,
+            { title: "Open library", kind: "info", okLabel: "Open it", cancelLabel: "Keep current" },
+          );
+          if (!ok) return;
+        }
+        update((d) => ({
+          ...d,
+          source: { path, added },
+          library: found,
+          dirty: false,
+          baseRevision: found.revision,
+        }));
+        await refreshAll(dbRef.current!);
+        return;
+      }
+
+      // The same library at a new root (moved, or restored from a backup):
+      // its manifest already speaks for the new place.
+      if (found) {
+        update((d) => ({ ...d, source: { path, added } }));
+        await refreshAll(dbRef.current!);
+        return;
+      }
+
+      // No library there yet: carry the crates over. With tracks to carry,
+      // show where they will end up and let the user back out first.
       let scan: ScanResult | undefined;
-      if (previous && allTrackPaths(current.crates).length > 0) {
+      if (previous && local && allTrackPaths(local.crates).length > 0) {
         setSourceStatus({ kind: "scanning" });
         try {
           scan = await scanLibrary(path);
@@ -285,7 +454,7 @@ export function useLibrary(): Library {
           await refreshAll(current);
           return;
         }
-        const plan = relinkTree(path, current.crates, buildIndex(scan.files), previous);
+        const plan = relinkTree(path, local.crates, buildIndex(scan.files), previous);
         const ok = await confirm(describeRelink(previous, path, plan), {
           title: "Change source",
           kind: plan.ambiguous + plan.notFound > 0 ? "warning" : "info",
@@ -298,7 +467,7 @@ export function useLibrary(): Library {
         }
       }
 
-      update((d) => ({ ...d, source: { path, added: new Date().toISOString() } }));
+      update((d) => ({ ...d, source: { path, added } }));
       await refreshAll(dbRef.current!, scan, previous);
     } finally {
       setBusy(false);
@@ -307,7 +476,7 @@ export function useLibrary(): Library {
 
   const addClone = useCallback(async () => {
     const current = dbRef.current;
-    if (!current?.source || sourceStatus?.kind !== "ready") return;
+    if (!current?.source || !current.library || sourceStatus?.kind !== "ready") return;
     setError(null);
     const path = await pickFolder("Choose a folder for the clone (empty, or an existing clone)");
     if (!path) return;
@@ -326,7 +495,7 @@ export function useLibrary(): Library {
     setBusy(true);
     update((d) => ({ ...d, clones: [...d.clones, clone] }));
     try {
-      await attachOne(current.source.path, clone, sourceStatus.scan);
+      await attachOne(current.library, current.source.path, clone, sourceStatus.scan);
     } catch (e) {
       // A folder that can't be a clone shouldn't stay in the list.
       update((d) => ({ ...d, clones: d.clones.filter((c) => c.path !== path) }));
@@ -349,13 +518,13 @@ export function useLibrary(): Library {
     async (path: string) => {
       const current = dbRef.current;
       const status = cloneStatusRef.current[path];
-      if (!current?.source || status?.kind !== "ready") return;
+      if (!current?.source || !current.library || status?.kind !== "ready") return;
 
       setError(null);
       setBusy(true);
       setClone(path, { kind: "working", progress: "Starting…", ready: status });
       try {
-        const lastSync = await runSync(current.source.path, path, current.crates, (progress) =>
+        const lastSync = await runSync(current.library, current.source.path, path, (progress) =>
           setClone(path, { kind: "working", progress, ready: status }),
         );
         setClone(path, { ...status, lastSync });
@@ -433,17 +602,21 @@ export function useLibrary(): Library {
     [setClone],
   );
 
-  const setDurations = useCallback(
-    (updates: Record<string, number>) =>
-      update((d) => ({ ...d, durations: { ...d.durations, ...updates } })),
-    [update],
-  );
-
   const rescan = useCallback(async () => {
     if (dbRef.current) await refreshAll(dbRef.current);
   }, [refreshAll]);
 
   const unresolved = sourceStatus?.kind === "ready" ? sourceStatus.relink.unresolved : EMPTY_UNRESOLVED;
+
+  const tracks = db?.library?.tracks;
+  const durations = useMemo(() => {
+    if (!tracks) return EMPTY_DURATIONS;
+    const out: Record<string, number> = {};
+    for (const [key, entry] of Object.entries(tracks)) {
+      if (entry.duration !== undefined) out[key] = entry.duration;
+    }
+    return out;
+  }, [tracks]);
 
   return {
     loading: db === null,
@@ -452,12 +625,14 @@ export function useLibrary(): Library {
     busy,
     source: db?.source ?? null,
     sourceStatus,
+    library: db?.library ?? null,
+    dirty: db?.dirty ?? false,
     unresolved,
     clones: db?.clones ?? [],
     cloneStatus,
-    crates: db?.crates ?? [],
+    crates: db?.library?.crates ?? EMPTY_CRATES,
     setCrates,
-    durations: db?.durations ?? EMPTY_DURATIONS,
+    durations,
     setDurations,
     changeSource,
     addClone,
@@ -472,17 +647,28 @@ export function useLibrary(): Library {
 /** Stable empty values, so consumers don't see a new object every render. */
 const EMPTY_DURATIONS: Record<string, number> = {};
 const EMPTY_UNRESOLVED: Unresolved = new Map();
+const EMPTY_CRATES: CrateTree = [];
 
 function sameRoot(a: string, b: string): boolean {
   return normalizeRoot(a).toLowerCase() === normalizeRoot(b).toLowerCase();
 }
 
-/** The database with a relink plan's moves written through every place a path is kept. */
+/**
+ * The database with a relink plan's moves written through every place a
+ * path is kept. Rewritten paths are a change to the library, so clones
+ * pick them up: the revision moves on.
+ */
 function applyPlan(db: AppDb, plan: RelinkPlan): AppDb {
+  const library = db.library ?? newSourceManifest("");
   return {
     ...db,
-    crates: plan.tree,
-    durations: remapDurations(db.durations, plan.moves),
+    library: {
+      ...library,
+      crates: plan.tree,
+      tracks: remapKeys(library.tracks, plan.moves),
+      revision: library.revision + 1,
+    },
+    dirty: true,
     clones: db.clones.map((c) => ({
       ...c,
       conflicts: c.conflicts.map((k) => ({ ...k, path: movedPath(k.path, plan.moves) })),

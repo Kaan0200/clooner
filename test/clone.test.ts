@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { cloneFolders, isInside, leafFolders } from "../src/core/clone";
+import { cloneFolders, cloneTrackPath, isInside, leafFolders } from "../src/core/clone";
 
 describe("isInside", () => {
   it("detects nesting with mixed separators and case", () => {
@@ -33,5 +33,21 @@ describe("leafFolders", () => {
 
   it("does not treat a sibling with a shared prefix as a child", () => {
     expect(leafFolders(["Club", "Club 2024"])).toEqual(["Club", "Club 2024"]);
+  });
+});
+
+describe("cloneTrackPath", () => {
+  it("places a track under Tracks/ from its tree path or its absolute path", () => {
+    expect(cloneTrackPath("C:/Music", "E:\\", "Club/One.mp3")).toBe("E:/Tracks/Club/One.mp3");
+    expect(cloneTrackPath("C:/Music", "E:/", "C:\\Music\\Club\\One.mp3")).toBe("E:/Tracks/Club/One.mp3");
+  });
+
+  it("has no place for a track outside the library", () => {
+    expect(cloneTrackPath("C:/Music", "E:/", "D:/Other/One.mp3")).toBeNull();
+    expect(cloneTrackPath("C:/Music", "E:/", "C:/Music")).toBeNull();
+  });
+
+  it("encodes names that are illegal on FAT drives", () => {
+    expect(cloneTrackPath("C:/Music", "E:/", "Mix: Vol 1/What?.mp3")).toBe("E:/Tracks/Mix： Vol 1/What？.mp3");
   });
 });

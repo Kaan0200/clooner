@@ -9,9 +9,12 @@ import { describeSource } from "@/lib/utils";
  */
 export function SourceDot({
   source,
+  name,
   status,
 }: {
   source: SourceEntry;
+  /** What the library is called, when it has a name. */
+  name?: string;
   status: SourceStatus | null;
 }) {
   const color =
@@ -20,7 +23,7 @@ export function SourceDot({
       : status?.kind === "scanning"
         ? "bg-amber-500"
         : "bg-destructive";
-  const detail = `Source: ${source.path}. ${describeSource(status)}.`;
+  const detail = `Source${name ? ` "${name}"` : ""}: ${source.path}. ${describeSource(status)}.`;
   return (
     <span
       role="img"

@@ -10,7 +10,6 @@ import { SelectionMarker } from "./SelectionMarker";
 interface TrackRowProps {
   rowKey: string;
   row: Extract<TreeRow, { kind: "track" }>;
-  sourceRoot: string | null;
   selected: boolean;
   /** Something is being dragged over this row's crate right now. */
   dropTarget: boolean;
@@ -29,7 +28,6 @@ interface TrackRowProps {
 export function TrackRow({
   rowKey,
   row,
-  sourceRoot,
   selected,
   dropTarget,
   dragging,
@@ -41,8 +39,8 @@ export function TrackRow({
 }: TrackRowProps) {
   const path = row.path;
   const title = titleOf(path);
-  // Where the file sits, relative to the library when it is inside it.
-  const folder = folderOf(path, sourceRoot);
+  // Where the file sits: its folder in the library, or its own folder when outside it.
+  const folder = folderOf(path);
 
   return (
     <div

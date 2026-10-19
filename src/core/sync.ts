@@ -9,6 +9,7 @@
 
 import { cloneTrackPath, normalizeRoot } from "./clone";
 import { encodeName } from "./names";
+import { isAbsolutePath, relativePath } from "./paths";
 import type { CrateNode, CrateTree } from "./tree";
 
 export interface TrackJob {
@@ -27,20 +28,24 @@ export interface TrackPlan {
   outside: string[];
 }
 
-/** Where each of some source tracks belongs in the clone. */
+/**
+ * Where each of some tracks belongs in the clone. Tracks are tree paths
+ * (relative to the source root) or absolute paths; absolute paths outside
+ * the root are set aside.
+ */
 export function planTracks(sourceRoot: string, cloneRoot: string, paths: string[]): TrackPlan {
   const root = normalizeRoot(sourceRoot);
   const unique = new Map<string, TrackJob>();
   const outside: string[] = [];
   for (const track of paths) {
-    const clonePath = cloneTrackPath(root, cloneRoot, track);
-    if (clonePath === null) {
+    const relative = isAbsolutePath(track) ? relativePath(root, track) : normalizeRoot(track);
+    const clonePath = relative === null ? null : cloneTrackPath(root, cloneRoot, relative);
+    if (relative === null || clonePath === null) {
       outside.push(track);
       continue;
     }
-    const relative = normalizeRoot(track).slice(root.length + 1);
     const key = relative.toLowerCase();
-    if (!unique.has(key)) unique.set(key, { source: track, relative, clonePath });
+    if (!unique.has(key)) unique.set(key, { source: `${root}/${relative}`, relative, clonePath });
   }
   return { tracks: [...unique.values()], outside };
 }

@@ -5,6 +5,7 @@ import { ScrollArea } from "@/ui/atoms/scroll-area";
 import { durationKey } from "@/core/duration";
 import { issuesFor, trackIssues } from "@/core/issues";
 import { titleOf } from "@/core/m3u";
+import { absolutePath, isAbsolutePath, trackPath } from "@/core/paths";
 import {
   addCrate,
   addTracks,
@@ -71,14 +72,22 @@ export default function App({ library }: Props) {
   const treeRef = useRef<HTMLDivElement>(null);
 
   const rows = visibleRows(tree, expanded);
+  const sourceRoot = library.source?.path ?? null;
 
-  // Track lengths: known ones come from the database, the rest are read from
-  // the files in the background and saved as they arrive.
-  const known = useDurations(
-    allTrackPaths(tree),
-    library.durations,
-    library.setDurations,
+  // Track lengths: known ones come from the library, the rest are read from
+  // the files in the background and saved as they arrive. Without a source
+  // root, only tracks outside the library have a file to read.
+  const durationTargets = useMemo(
+    () =>
+      allTrackPaths(tree)
+        .filter((p) => sourceRoot !== null || isAbsolutePath(p))
+        .map((p) => ({
+          key: durationKey(p),
+          file: sourceRoot === null ? p : absolutePath(sourceRoot, p),
+        })),
+    [tree, sourceRoot],
   );
+  const known = useDurations(durationTargets, library.durations, library.setDurations);
   // Sync conflicts, tracks not found, duplicates and shared tracks,
   // recomputed only when the crates, clones or last scan change.
   const issues = useMemo(
@@ -112,8 +121,8 @@ export default function App({ library }: Props) {
   }, [selectedKey, rows.length]);
 
   // Handlers that outlive a render read the latest state through refs.
-  const latest = useRef({ tree, onChange, copyToClones: library.copyToClones });
-  latest.current = { tree, onChange, copyToClones: library.copyToClones };
+  const latest = useRef({ tree, onChange, sourceRoot, copyToClones: library.copyToClones });
+  latest.current = { tree, onChange, sourceRoot, copyToClones: library.copyToClones };
 
   useEffect(() => {
     // Outside Tauri (plain browser dev) there is no native drag-drop channel.
@@ -168,10 +177,12 @@ export default function App({ library }: Props) {
       return;
     }
 
-    // The tree may have changed while files were being listed.
+    // The tree may have changed while files were being listed. Files inside
+    // the library are recorded relative to its root.
     const fresh = latest.current.tree;
     if (!findCrate(fresh, crateId)) return;
-    const { tree: next, added } = addTracks(fresh, crateId, files);
+    const tracks = files.map((f) => trackPath(latest.current.sourceRoot, f));
+    const { tree: next, added } = addTracks(fresh, crateId, tracks);
     if (added > 0) latest.current.onChange(next);
     const skipped = files.length - added;
     const membership =
@@ -182,7 +193,7 @@ export default function App({ library }: Props) {
 
     // The files go onto every connected clone right away.
     setNotice(`${membership}. Copying to clones…`);
-    const copy = await latest.current.copyToClones(files);
+    const copy = await latest.current.copyToClones(tracks);
     const copied =
       copy.clones === 0
         ? "no clone is connected, so nothing was copied"
@@ -464,7 +475,6 @@ export default function App({ library }: Props) {
   }
 
   const fileDragging = fileDropTargetId !== null;
-  const sourceRoot = library.source?.path ?? null;
 
   // The crate highlighted as the target of whatever drag is in progress.
   const activeDrag = drag?.active ? drag : null;
@@ -532,7 +542,6 @@ export default function App({ library }: Props) {
                     key={key}
                     rowKey={key}
                     row={row}
-                    sourceRoot={sourceRoot}
                     selected={key === selectedKey}
                     dropTarget={row.crateId === targetCrateId}
                     dragging={fileDragging}
@@ -586,7 +595,11 @@ export default function App({ library }: Props) {
       <footer className="flex min-h-7 items-center justify-between gap-3 border-t px-3 py-1.5 text-xs text-muted-foreground">
         <span className="flex items-center">
           {library.source && (
-            <SourceDot source={library.source} status={library.sourceStatus} />
+            <SourceDot
+              source={library.source}
+              name={library.library?.name}
+              status={library.sourceStatus}
+            />
           )}
         </span>
         {notice && (

@@ -11,7 +11,9 @@
 //     `database V2` there so Serato knows them.
 //
 // Every copy records both sides' size and modification time in the clone's
-// `clooner.json`, so the next sync can tell which side actually changed.
+// manifest, so the next sync can tell which side actually changed. A sync
+// also writes the source's crates and revision into the clone's manifest, so
+// the clone describes the library on its own.
 //
 // Files follow moves without being copied again: when a track's place in
 // the clone is empty but a file with its name sits elsewhere under
@@ -42,15 +44,8 @@ import {
   type SyncRecord,
   type TrackJob,
 } from "@/core/sync";
-import type { CrateTree } from "@/core/tree";
-import {
-  cloneMarker,
-  forEachConcurrent,
-  readCloneDb,
-  scanLibrary,
-  writeCloneDb,
-  type CloneDb,
-} from "@/lib/library";
+import type { Manifest } from "@/core/manifest";
+import { forEachConcurrent, readManifestAt, scanLibrary, writeManifestAt } from "@/lib/library";
 
 export interface CopySummary {
   copied: number;
@@ -65,9 +60,9 @@ export interface CopySummary {
 }
 
 /**
- * Copies some source tracks into the clone, skipping files whose source
- * hasn't changed since they were last copied, and records what was copied
- * in the clone's `clooner.json`.
+ * Copies some tracks (tree paths) into the clone, skipping files whose
+ * source hasn't changed since they were last copied, and records what was
+ * copied in the clone's manifest.
  */
 export async function copyTracks(
   sourceRoot: string,
@@ -75,11 +70,10 @@ export async function copyTracks(
   paths: string[],
   onProgress: (message: string) => void,
 ): Promise<CopySummary> {
-  const db = await readCloneDb(cloneMarker(cloneRoot));
-  if (!db) throw new Error("That folder isn't an attached clone.");
+  const db = await readClone(cloneRoot);
 
   const plan = planTracks(sourceRoot, cloneRoot, paths);
-  const synced = syncRecords(db);
+  const synced = { ...db.synced };
   const summary: CopySummary = {
     copied: 0,
     unchanged: 0,
@@ -109,12 +103,12 @@ export async function copyTracks(
   });
 
   summary.finished = new Date().toISOString();
-  if (summary.copied > 0) await writeCloneDb(cloneRoot, { ...db, synced });
+  if (summary.copied > 0) await writeManifestAt(cloneRoot, { ...db, synced });
   return summary;
 }
 
 export interface SyncConflict {
-  /** The track's source path. */
+  /** The track's tree path. */
   path: string;
   kept: "source" | "clone";
 }
@@ -152,19 +146,22 @@ export interface SyncSummary {
  * drive's `_Serato_/Subcrates` and adds the tracks to its `database V2`.
  * Members are listed where they live in the clone, relative to the volume
  * root as Serato expects, even when the file is missing, since the crate is
- * the truth.
+ * the truth. Finally the clone's manifest takes the source's crates and
+ * revision, and records the sync with the source.
  */
 export async function syncClone(
+  source: Manifest,
   sourceRoot: string,
   cloneRoot: string,
-  crates: CrateTree,
   onProgress: (message: string) => void,
 ): Promise<SyncSummary> {
-  const db = await readCloneDb(cloneMarker(cloneRoot));
-  if (!db) throw new Error("That folder isn't an attached clone.");
+  const db = await readClone(cloneRoot);
+  if (db.libraryId && source.libraryId && db.libraryId !== source.libraryId) {
+    throw new Error("That clone belongs to a different library.");
+  }
 
-  const jobs = planCrates(sourceRoot, cloneRoot, crates);
-  const synced = syncRecords(db);
+  const jobs = planCrates(sourceRoot, cloneRoot, source.crates);
+  const synced = { ...db.synced };
   const summary: SyncSummary = {
     relinked: 0,
     toClone: 0,
@@ -233,7 +230,7 @@ export async function syncClone(
     if (decision.bothChanged) {
       summary.bothChanged += 1;
       summary.conflicts.push({
-        path: track.source,
+        path: track.relative,
         kept: decision.direction === "toSource" ? "clone" : "source",
       });
     }
@@ -276,7 +273,24 @@ export async function syncClone(
   }
 
   summary.finished = new Date().toISOString();
-  await writeCloneDb(cloneRoot, { ...db, lastSync: summary.finished, synced });
+  await writeManifestAt(cloneRoot, {
+    ...db,
+    libraryId: source.libraryId,
+    revision: source.revision,
+    crates: source.crates,
+    tracks: source.tracks,
+    synced,
+    peers: {
+      ...db.peers,
+      [source.locationId]: {
+        name: source.name,
+        kind: "source",
+        revision: source.revision,
+        lastSync: summary.finished,
+        path: normalizeRoot(sourceRoot),
+      },
+    },
+  });
   return summary;
 }
 
@@ -298,13 +312,11 @@ async function addToDatabase(cloneRoot: string, tracks: TrackInfo[]): Promise<nu
   return added;
 }
 
-/** The clone's copy records, upgrading entries older markers wrote with only the source state. */
-function syncRecords(db: CloneDb): Record<string, SyncRecord> {
-  const out: Record<string, SyncRecord> = {};
-  for (const [key, value] of Object.entries(db.synced ?? {})) {
-    out[key] = "source" in value ? value : { source: value, clone: value };
-  }
-  return out;
+/** The clone's manifest, which must be there and be a clone's. */
+async function readClone(cloneRoot: string): Promise<Manifest> {
+  const db = await readManifestAt(cloneRoot);
+  if (!db || db.kind !== "clone") throw new Error("That folder isn't an attached clone.");
+  return db;
 }
 
 /** Copies `from` over `to`, creating folders as needed, and reports both sides afterwards. */

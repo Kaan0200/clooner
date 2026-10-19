@@ -1,16 +1,21 @@
-// Keeps track lengths available for a set of paths: what the database
+// Keeps track lengths available for a set of tracks: what the library
 // already knows is used as is, anything else is read from the files and
 // saved back in batches.
 
 import { useEffect, useRef, useState } from "react";
-import { durationKey } from "@/core/duration";
 import { readDurations } from "@/lib/durations";
 
 /** How long to gather freshly read lengths before saving them together. */
 const SAVE_DELAY_MS = 500;
 
+/** A track to know the length of: its key in the library and the file to read. */
+export interface DurationTarget {
+  key: string;
+  file: string;
+}
+
 export function useDurations(
-  paths: string[],
+  targets: DurationTarget[],
   saved: Record<string, number>,
   save: (updates: Record<string, number>) => void,
 ): Record<string, number> {
@@ -28,16 +33,19 @@ export function useDurations(
   // Which files still need reading. Keyed so the effect only reruns when the
   // set of unknown tracks actually changes, not on every render.
   const missing = canRead
-    ? paths.filter((p) => {
-        const key = durationKey(p);
-        return saved[key] === undefined && fresh[key] === undefined && !failed.current.has(key);
-      })
+    ? targets.filter(
+        (t) => saved[t.key] === undefined && fresh[t.key] === undefined && !failed.current.has(t.key),
+      )
     : [];
-  const missingKey = missing.map(durationKey).sort().join("\n");
+  const missingKey = missing
+    .map((t) => t.key)
+    .sort()
+    .join("\n");
 
   useEffect(() => {
     if (missing.length === 0) return;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    const keyOf = new Map(missing.map((t) => [t.file, t.key]));
 
     const flush = () => {
       timer = undefined;
@@ -46,16 +54,20 @@ export function useDurations(
       if (Object.keys(updates).length > 0) saveRef.current(updates);
     };
 
-    const cancel = readDurations(missing, (path, seconds) => {
-      const key = durationKey(path);
-      if (seconds === null) {
-        failed.current.add(key);
-        return;
-      }
-      setFresh((prev) => ({ ...prev, [key]: seconds }));
-      pendingSave.current[key] = seconds;
-      timer ??= setTimeout(flush, SAVE_DELAY_MS);
-    });
+    const cancel = readDurations(
+      missing.map((t) => t.file),
+      (file, seconds) => {
+        const key = keyOf.get(file);
+        if (key === undefined) return;
+        if (seconds === null) {
+          failed.current.add(key);
+          return;
+        }
+        setFresh((prev) => ({ ...prev, [key]: seconds }));
+        pendingSave.current[key] = seconds;
+        timer ??= setTimeout(flush, SAVE_DELAY_MS);
+      },
+    );
 
     return () => {
       cancel();

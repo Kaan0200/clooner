@@ -117,7 +117,7 @@ export function MainButtons({
           >
             {source ? <HardDrive /> : <Plus />}
             <span className="truncate">
-              {source ? baseName(source.path) : "Add Source"}
+              {source ? library.library?.name || baseName(source.path) : "Add Source"}
             </span>
           </Button>
         </HintTarget>

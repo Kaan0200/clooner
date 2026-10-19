@@ -23,9 +23,11 @@ Keep the logic in TypeScript. File I/O goes through `@tauri-apps/plugin-fs` and 
 
 - **Library (logical):** tracks plus crates. A crate is a set of tracks. Crates are the same in every location.
 - **Collection:** a top-level crate (for example `Weddings` or `Club`) with its subcrates. All collections share the same SOURCE.
-- **Location:** a root folder with a database file at its root.
+- **Location:** a root folder with a manifest (`clooner.json`) at its root (`src/core/manifest.ts`). The manifest makes the location self-describing: its kind, a library id shared by every location of the library, its own location id, a name, the library's revision, the crate tree, per-track facts, and the peers it has synced with. The source's manifest is the truth; the app database on a computer (`src/core/db.ts`) keeps a copy so crates can be shown and edited while the source folder is away, and writes it back when the folder returns.
   - **SOURCE:** the complete music library. It may contain tracks that are not in any crate, and it must have a single root folder.
   - **CLONE:** a partial mirror. It holds only the tracks in the crates it syncs.
+- **Track paths are relative to the library root** (`src/core/paths.ts`). The same string names the file under the source root and, encoded, under a clone's `Tracks/`, so the crate tree means the same thing in every location. A track outside the library keeps its absolute path and has no place in a clone.
+- **Revision:** every crate change at the source bumps the library's revision. A clone records the revision its crates are based on. When two locations meet, the higher revision is the base (see the design doc for the source-revision model).
 - **Layout of each location:**
   - `Tracks/` holds the real files. Paths match SOURCE, relative to the root. On SOURCE, the root folder itself is the tracks folder; SOURCE is never reorganized.
   - `Crates/` has one folder per crate, holding one generated `.m3u` stub per song, so every crate looks complete when browsing. Only changed stubs are written, because creating many small files is slow on cheap USB drives. Stubs use about 1% of the space the audio does.
@@ -49,7 +51,7 @@ Applies to `Tracks/` paths and to `Crates/` folder and stub names. Track paths i
 ## Sync
 
 - **Any two locations can sync.** There is no fixed parent and child.
-- **Each location's database stores the last-synced state for each peer location.** This is the base for three-way comparison.
+- **Each location's manifest records the revision it last agreed on with each peer.** Per-track stamps (size, time, revision last changed) say whether a file was edited locally; they replace the per-peer copy records a clone keeps today.
 - **Track identity is the file name** (ignoring case and extension). File names don't change; folders do.
   - A track that isn't where its path says is looked for by name under the root on every scan, and relinked when exactly one file has that name. Several files with the name are narrowed by the old relative place, then extension, then parent folder name; a tie that remains is flagged, as is a name found nowhere (`src/core/relink.ts`).
   - A renamed file is therefore a new track; the old entry is flagged as not found.

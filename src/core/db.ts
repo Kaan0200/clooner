@@ -1,13 +1,18 @@
-// The application database: what the app remembers between launches.
+// The application database: what this computer remembers between launches.
 //
-// It is one JSON document holding the source library, the clones, and the
-// crate tree. This module only knows the shape and how to read it
-// tolerantly; where it lives on disk is the store's business.
+// It is one JSON document holding where the source is, which clones are
+// known, and a copy of the source's manifest (the library). The manifest at
+// the source root is the truth; the copy here lets the app show and edit
+// the crates while the source folder is away, and is written back to the
+// root when the folder returns. This module only knows the shape and how to
+// read it tolerantly; where it lives on disk is the store's business.
 
 import type { Conflict } from "./issues";
-import type { CrateNode, CrateTree } from "./tree";
+import { manifestFrom, newSourceManifest, type Manifest } from "./manifest";
+import { baseName, trackPath } from "./paths";
+import type { CrateTree } from "./tree";
 
-export const DB_VERSION = 1;
+export const DB_VERSION = 2;
 
 export interface SourceEntry {
   /** Absolute path of the library root. */
@@ -19,7 +24,7 @@ export interface SourceEntry {
 export interface CloneEntry {
   /** Absolute path of the clone root. */
   path: string;
-  /** The id from the clone's own `clooner.json`, once it has been read. */
+  /** The clone's location id from its manifest, once it has been read. */
   id: string | null;
   /** When it was added, ISO 8601. */
   added: string;
@@ -33,13 +38,16 @@ export interface AppDb {
   version: typeof DB_VERSION;
   source: SourceEntry | null;
   clones: CloneEntry[];
-  crates: CrateTree;
-  /** Track lengths in seconds, keyed by normalized lower-case path (see core/duration.ts). */
-  durations: Record<string, number>;
+  /** The source's manifest as last read from its root or edited here. Null until there are crates. */
+  library: Manifest | null;
+  /** The revision the root's manifest had when `library` was last read from or written to it. */
+  baseRevision: number;
+  /** True when `library` holds changes not yet written to the source root. */
+  dirty: boolean;
 }
 
 export function emptyDb(): AppDb {
-  return { version: DB_VERSION, source: null, clones: [], crates: [], durations: {} };
+  return { version: DB_VERSION, source: null, clones: [], library: null, baseRevision: 0, dirty: false };
 }
 
 export function serializeDb(db: AppDb): string {
@@ -49,8 +57,10 @@ export function serializeDb(db: AppDb): string {
 /**
  * Parses a saved database. Missing or malformed sections fall back to empty
  * rather than failing the whole load, so a field added in a later version
- * never locks a user out. Throws only when the text isn't a JSON object at
- * all, or claims a version this build can't read.
+ * never locks a user out. A version 1 database, which kept the crate tree
+ * and track lengths itself, is turned into a library manifest to be written
+ * to the source root. Throws only when the text isn't a JSON object at all,
+ * or claims a version this build can't read.
  */
 export function parseDb(text: string): AppDb {
   let raw: unknown;
@@ -66,22 +76,74 @@ export function parseDb(text: string): AppDb {
     throw new Error(`The database was written by a newer clooner (version ${version}).`);
   }
 
+  const source = parseSource(raw.source);
+  const clones = Array.isArray(raw.clones) ? raw.clones.flatMap((c) => optional(parseClone(c))) : [];
+  if (version < 2) return upgradeV1(raw, source, clones);
+
+  let library: Manifest | null = null;
+  if (raw.library !== null && raw.library !== undefined) {
+    try {
+      library = manifestFrom(raw.library);
+    } catch {
+      library = null;
+    }
+  }
   return {
     version: DB_VERSION,
-    source: parseSource(raw.source),
-    clones: Array.isArray(raw.clones) ? raw.clones.flatMap((c) => optional(parseClone(c))) : [],
-    crates: parseCrates(raw.crates),
-    durations: parseDurations(raw.durations),
+    source,
+    clones,
+    library,
+    baseRevision: typeof raw.baseRevision === "number" ? raw.baseRevision : 0,
+    dirty: raw.dirty === true,
   };
 }
 
-function parseDurations(value: unknown): Record<string, number> {
-  if (!isRecord(value)) return {};
-  const out: Record<string, number> = {};
-  for (const [key, seconds] of Object.entries(value)) {
-    if (typeof seconds === "number" && Number.isFinite(seconds) && seconds >= 0) out[key] = seconds;
+/**
+ * A version 1 database held the crate tree with absolute track paths and
+ * the track lengths. They become a source manifest, with paths made
+ * relative to the source root, marked dirty so it is written to the root.
+ */
+function upgradeV1(raw: Record<string, unknown>, source: SourceEntry | null, clones: CloneEntry[]): AppDb {
+  const crates = relativizeTree(parseCratesLoose(raw.crates), source?.path ?? null);
+  const hasCrates = crates.length > 0;
+  if (!hasCrates && !source) {
+    return { version: DB_VERSION, source, clones, library: null, baseRevision: 0, dirty: false };
   }
-  return out;
+  const library = newSourceManifest(source ? baseName(source.path) : "", crates);
+  if (isRecord(raw.durations)) {
+    for (const [key, seconds] of Object.entries(raw.durations)) {
+      if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds < 0) continue;
+      const relative = trackPath(source?.path ?? null, key);
+      library.tracks[relative.toLowerCase()] = { duration: seconds };
+    }
+  }
+  return {
+    version: DB_VERSION,
+    source,
+    clones: clones.map((c) => ({
+      ...c,
+      conflicts: c.conflicts.map((k) => ({ ...k, path: trackPath(source?.path ?? null, k.path) })),
+    })),
+    library,
+    baseRevision: 0,
+    dirty: true,
+  };
+}
+
+function relativizeTree(tree: CrateTree, root: string | null): CrateTree {
+  return tree.map((node) => ({
+    ...node,
+    tracks: node.tracks.map((t) => trackPath(root, t)),
+    children: relativizeTree(node.children, root),
+  }));
+}
+
+function parseCratesLoose(value: unknown): CrateTree {
+  try {
+    return manifestFrom({ kind: "source", locationId: "x", crates: value }).crates;
+  } catch {
+    return [];
+  }
 }
 
 function parseSource(value: unknown): SourceEntry | null {
@@ -106,31 +168,6 @@ function parseConflict(value: unknown): Conflict | null {
     path: value.path,
     kept: value.kept === "clone" ? "clone" : "source",
     when: isoOr(value.when),
-  };
-}
-
-function parseCrates(value: unknown): CrateTree {
-  if (!Array.isArray(value)) return [];
-  const seen = new Set<string>();
-  return value.flatMap((n) => optional(parseCrate(n, seen)));
-}
-
-function parseCrate(value: unknown, seen: Set<string>): CrateNode | null {
-  if (!isRecord(value) || typeof value.name !== "string") return null;
-  // A crate without a usable id gets a fresh one; a duplicate would break
-  // selection and editing, so it is dropped.
-  const id = typeof value.id === "string" && value.id !== "" ? value.id : crypto.randomUUID();
-  if (seen.has(id)) return null;
-  seen.add(id);
-  return {
-    id,
-    name: value.name,
-    children: Array.isArray(value.children)
-      ? value.children.flatMap((c) => optional(parseCrate(c, seen)))
-      : [],
-    tracks: Array.isArray(value.tracks)
-      ? value.tracks.filter((t): t is string => typeof t === "string")
-      : [],
   };
 }
 

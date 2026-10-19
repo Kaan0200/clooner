@@ -1,10 +1,11 @@
-// Where the application database lives and how it gets there safely.
+// Where the application database lives and how files get written safely.
 //
-// The file sits in the app's data folder (on Windows, `%APPDATA%/dev.clooner.app`).
-// Saves go to a temporary file first and are then renamed into place, so a
-// crash mid-write leaves the previous database intact rather than a half
-// file. Saves are also coalesced: a burst of changes writes once, with the
-// newest state.
+// The database sits in the app's data folder (on Windows,
+// `%APPDATA%/dev.clooner.app`). Every file this module writes, the database
+// and the manifests at location roots alike, goes to a temporary file first
+// and is then renamed into place, so a crash mid-write leaves the previous
+// file intact rather than a half one. Writes are also coalesced per file: a
+// burst of changes writes once, with the newest text.
 
 import { appDataDir, join } from "@tauri-apps/api/path";
 import { exists, mkdir, readTextFile, rename, writeTextFile } from "@tauri-apps/plugin-fs";
@@ -54,36 +55,47 @@ export async function loadDb(): Promise<LoadResult> {
   }
 }
 
-let newest: AppDb | null = null;
-let inFlight: Promise<void> | null = null;
+/** Saves the database. Bursts of calls are folded into one write of the newest state. */
+export async function saveDb(db: AppDb): Promise<void> {
+  const dir = await dataDir();
+  await mkdir(dir, { recursive: true });
+  await writeTextAtomic(await join(dir, FILE_NAME), serializeDb(db));
+}
+
+interface Queue {
+  newest: string | null;
+  inFlight: Promise<void> | null;
+}
+
+const queues = new Map<string, Queue>();
 
 /**
- * Saves the database. Calls made while a save is running are folded into
- * one more write of whatever state is newest when it starts.
+ * Writes `text` to `path` through a temporary file and a rename. Calls for
+ * the same path made while a write is running are folded into one more
+ * write of whatever text is newest when it starts.
  */
-export function saveDb(db: AppDb): Promise<void> {
-  newest = db;
-  inFlight ??= flush();
-  return inFlight;
+export function writeTextAtomic(path: string, text: string): Promise<void> {
+  let queue = queues.get(path);
+  if (!queue) {
+    queue = { newest: null, inFlight: null };
+    queues.set(path, queue);
+  }
+  queue.newest = text;
+  queue.inFlight ??= flush(path, queue);
+  return queue.inFlight;
 }
 
-async function flush(): Promise<void> {
+async function flush(path: string, queue: Queue): Promise<void> {
   try {
-    while (newest) {
-      const db = newest;
-      newest = null;
-      await write(db);
+    while (queue.newest !== null) {
+      const text = queue.newest;
+      queue.newest = null;
+      const temp = `${path}.tmp`;
+      await writeTextFile(temp, text);
+      await rename(temp, path);
     }
   } finally {
-    inFlight = null;
+    queue.inFlight = null;
+    queues.delete(path);
   }
-}
-
-async function write(db: AppDb): Promise<void> {
-  const dir = await dataDir();
-  const path = await join(dir, FILE_NAME);
-  const temp = await join(dir, `${FILE_NAME}.tmp`);
-  await mkdir(dir, { recursive: true });
-  await writeTextFile(temp, serializeDb(db));
-  await rename(temp, path);
 }

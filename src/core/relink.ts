@@ -7,10 +7,14 @@
 // anything still ambiguous or absent is reported so the user can decide.
 // Nothing here touches the disk: the caller supplies an index of the files
 // it found and gets back a rewritten tree plus the counts.
+//
+// Paths in the tree are relative to the library root (see core/paths.ts).
+// When the root itself has moved, `oldRoot` says where the paths were
+// recorded against, so a file that stayed put on disk is found at its new
+// relative place without a search.
 
-import { isInside, normalizeRoot } from "./clone";
-import { durationKey } from "./duration";
 import { titleOf } from "./m3u";
+import { absolutePath, isAbsolutePath, normalizeRoot, relativePath } from "./paths";
 import { trackKey, type CrateNode, type CrateTree } from "./tree";
 
 /** The files under a root, ready to be searched by name or by path. */
@@ -40,47 +44,59 @@ export function buildIndex(relativeFiles: string[]): FileIndex {
 export type Match =
   /** The file is where the path says. */
   | { kind: "kept" }
-  /** Exactly one file with this name was found; `to` is its new absolute path. */
+  /** Exactly one file with this name was found; `to` is its new tree path. */
   | { kind: "moved"; to: string }
-  /** Several files with this name; none could be singled out. Absolute paths. */
+  /** Several files with this name; none could be singled out. Tree paths. */
   | { kind: "ambiguous"; candidates: string[] }
   /** No file with this name under the root. */
   | { kind: "notFound" };
 
 /**
+ * Where the file would be under `root` if it hadn't moved on disk: the
+ * track's own relative path, or, when the paths were recorded against
+ * `oldRoot`, that place seen from the new root. Null for a track outside
+ * the library.
+ */
+export function placeOf(root: string, track: string, oldRoot: string | null = null): string | null {
+  const normalRoot = normalizeRoot(root);
+  const path = normalizeRoot(track);
+  if (isAbsolutePath(path)) return relativePath(normalRoot, path);
+  if (oldRoot === null) return path;
+  return relativePath(normalRoot, absolutePath(oldRoot, path)) ?? path;
+}
+
+/**
  * Where a track is under `root` now. `oldRoot` is the root the path was
- * recorded against, when the library has moved; it lets a track keep its
- * relative place when several files share a name. `claimed` holds the
+ * recorded against, when the library has moved. `claimed` holds the
  * lower-cased relative paths of files that belong to other tracks, which
  * are never offered as a match.
  */
 export function matchTrack(
   root: string,
-  path: string,
+  track: string,
   index: FileIndex,
   oldRoot: string | null = null,
   claimed: ReadonlySet<string> = EMPTY,
 ): Match {
-  const normalRoot = normalizeRoot(root);
-  const normalPath = normalizeRoot(path);
-  const relative = relativeTo(normalRoot, normalPath);
-  if (relative !== null && index.paths.has(relative.toLowerCase())) return { kind: "kept" };
+  const path = normalizeRoot(track);
+  const place = placeOf(root, path, oldRoot);
+  if (place !== null && index.paths.has(place.toLowerCase())) {
+    return place === path ? { kind: "kept" } : { kind: "moved", to: place };
+  }
 
-  let candidates = (index.byTitle.get(titleOf(normalPath).toLowerCase()) ?? []).filter(
+  let candidates = (index.byTitle.get(titleOf(path).toLowerCase()) ?? []).filter(
     (c) => !claimed.has(c.toLowerCase()),
   );
   if (candidates.length === 0) return { kind: "notFound" };
 
   // Narrow a tie, but never to nothing: the same relative place first,
   // then the same extension, then the same parent folder name.
-  const wasAt = relative ?? (oldRoot ? relativeTo(normalizeRoot(oldRoot), normalPath) : null);
-  if (wasAt) candidates = narrow(candidates, (c) => c.toLowerCase() === wasAt.toLowerCase());
-  candidates = narrow(candidates, (c) => extensionOf(c) === extensionOf(normalPath));
-  candidates = narrow(candidates, (c) => parentName(c) === parentName(normalPath));
+  if (place) candidates = narrow(candidates, (c) => c.toLowerCase() === place.toLowerCase());
+  candidates = narrow(candidates, (c) => extensionOf(c) === extensionOf(path));
+  candidates = narrow(candidates, (c) => parentName(c) === parentName(path));
 
-  const absolute = candidates.map((c) => `${normalRoot}/${c}`);
-  if (absolute.length === 1) return { kind: "moved", to: absolute[0] };
-  return { kind: "ambiguous", candidates: absolute };
+  if (candidates.length === 1) return { kind: "moved", to: candidates[0] };
+  return { kind: "ambiguous", candidates };
 }
 
 const EMPTY: ReadonlySet<string> = new Set();
@@ -88,12 +104,6 @@ const EMPTY: ReadonlySet<string> = new Set();
 function narrow(candidates: string[], keep: (c: string) => boolean): string[] {
   const kept = candidates.filter(keep);
   return kept.length > 0 ? kept : candidates;
-}
-
-/** `path` relative to `root` (both normalized), or null when it isn't inside. */
-function relativeTo(root: string, path: string): string | null {
-  if (!isInside(root, path) || path.length === root.length) return null;
-  return path.slice(root.length + 1);
 }
 
 function extensionOf(path: string): string {
@@ -145,13 +155,12 @@ export function relinkTree(
     unresolved: new Map(),
   };
   // First pass: which files are spoken for by a member that is in place.
-  const normalRoot = normalizeRoot(root);
   const claimed = new Set<string>();
   const claim = (nodes: CrateNode[]) => {
     for (const node of nodes) {
       for (const path of node.tracks) {
-        const relative = relativeTo(normalRoot, normalizeRoot(path));
-        if (relative !== null && index.paths.has(relative.toLowerCase())) claimed.add(relative.toLowerCase());
+        const place = placeOf(root, path, oldRoot);
+        if (place !== null && index.paths.has(place.toLowerCase())) claimed.add(place.toLowerCase());
       }
       claim(node.children);
     }
@@ -205,18 +214,15 @@ export function relinkTree(
   return plan;
 }
 
-/** Carries saved track lengths over to the moved tracks' new paths. */
-export function remapDurations(
-  durations: Record<string, number>,
-  moves: Map<string, string>,
-): Record<string, number> {
-  if (moves.size === 0) return durations;
-  const out = { ...durations };
+/** Carries per-track records (keyed by track key) over to the moved tracks' new paths. */
+export function remapKeys<T>(byKey: Record<string, T>, moves: Map<string, string>): Record<string, T> {
+  if (moves.size === 0) return byKey;
+  const out = { ...byKey };
   for (const [from, to] of moves) {
-    const seconds = durations[durationKey(from)];
-    if (seconds === undefined) continue;
-    delete out[durationKey(from)];
-    out[durationKey(to)] = seconds;
+    const value = byKey[from];
+    if (value === undefined) continue;
+    delete out[from];
+    out[trackKey(to)] = value;
   }
   return out;
 }

@@ -2,7 +2,6 @@
 // rules, and the look the rows share.
 
 import type { PhysicalPosition } from "@tauri-apps/api/dpi";
-import { isInside, normalizeRoot } from "@/core/clone";
 import type { CloneEntry } from "@/core/db";
 import { formatDuration, sumDurations } from "@/core/duration";
 import {
@@ -18,27 +17,12 @@ import type { CopySummary, SyncSummary } from "@/lib/sync";
 import type { CloneStatus, RelinkSummary, SourceStatus } from "@/lib/useLibrary";
 
 export { cn } from "cn";
+export { baseName, folderOf } from "@/core/paths";
 
 // --- Text ------------------------------------------------------------------
 
 export function plural(n: number, word: string): string {
   return `${n.toLocaleString()} ${word}${n === 1 ? "" : "s"}`;
-}
-
-/** The last segment of a path, for a label; the full path goes in the tooltip. */
-export function baseName(path: string): string {
-  const trimmed = path.replace(/[\\/]+$/, "");
-  const i = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
-  return i >= 0 ? trimmed.slice(i + 1) || trimmed : trimmed;
-}
-
-/** The folder part of a path, relative to the library root when inside it. Empty at the root. */
-export function folderOf(path: string, sourceRoot: string | null): string {
-  const normalized = normalizeRoot(path);
-  const dir = normalized.slice(0, normalized.lastIndexOf("/"));
-  if (sourceRoot && isInside(sourceRoot, dir))
-    return dir.slice(normalizeRoot(sourceRoot).length + 1);
-  return dir;
 }
 
 export function relativeTime(iso: string): string {

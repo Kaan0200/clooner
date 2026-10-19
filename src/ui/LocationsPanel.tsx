@@ -24,6 +24,7 @@ export function LocationsPanel({ library }: { library: Library }) {
         <LocationCard
           icon={HardDrive}
           kind="Source"
+          name={library.library?.name}
           path={source.path}
           actions={
             <Button
@@ -45,11 +46,18 @@ export function LocationsPanel({ library }: { library: Library }) {
       {clones.map((clone) => {
         const status = cloneStatus[clone.path];
         const canSync = sourceReady && status?.kind === "ready" && !busy;
+        const name =
+          status?.kind === "ready"
+            ? status.result.name
+            : status?.kind === "working"
+              ? status.ready.result.name
+              : undefined;
         return (
           <LocationCard
             key={clone.path}
             icon={Usb}
             kind="Clone"
+            name={name}
             path={clone.path}
             actions={
               <>
@@ -87,12 +95,15 @@ export function LocationsPanel({ library }: { library: Library }) {
 function LocationCard({
   icon: Icon,
   kind,
+  name,
   path,
   children,
   actions,
 }: {
   icon: typeof HardDrive;
   kind: string;
+  /** What the DJ calls the location, once its manifest has been read. */
+  name?: string;
   path: string;
   children: React.ReactNode;
   actions?: React.ReactNode;
@@ -101,7 +112,7 @@ function LocationCard({
     <div className="flex items-center gap-3 rounded-lg border p-3">
       <Icon className="size-5 shrink-0 text-muted-foreground" />
       <div className="min-w-0 flex-1">
-        <div className="font-medium">{kind}</div>
+        <div className="font-medium">{name ? `${kind}: ${name}` : kind}</div>
         <div className="truncate text-muted-foreground" title={path}>
           {path}
         </div>

@@ -53,6 +53,15 @@ describe("planTracks", () => {
     expect(plan.outside).toEqual(["D:/Elsewhere/Two.mp3"]);
     expect(plan.tracks.map((t) => t.relative)).toEqual(["x.mp3"]);
   });
+
+  it("takes tree paths, which are relative to the source root", () => {
+    const plan = planTracks("C:\\Music", "E:\\", ["Club/One.mp3", "club\\one.mp3", "Mix: 1/Two.mp3"]);
+    expect(plan.tracks).toEqual([
+      { source: "C:/Music/Club/One.mp3", relative: "Club/One.mp3", clonePath: "E:/Tracks/Club/One.mp3" },
+      { source: "C:/Music/Mix: 1/Two.mp3", relative: "Mix: 1/Two.mp3", clonePath: "E:/Tracks/Mix： 1/Two.mp3" },
+    ]);
+    expect(plan.outside).toEqual([]);
+  });
 });
 
 describe("planCrates", () => {
