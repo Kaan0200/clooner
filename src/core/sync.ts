@@ -111,45 +111,75 @@ export function needsCopy(
   return !sameFile(previous.source, current);
 }
 
-export type Direction = "toClone" | "toSource" | "none" | "missing";
-
-export interface Decision {
-  direction: Direction;
-  /** Both sides changed since the last copy; the newer one was chosen. */
-  bothChanged: boolean;
-}
+export type PushAction =
+  /** The source's copy goes to the clone: the clone lacks it, or only the source changed. */
+  | "copy"
+  | "unchanged"
+  /** The clone's copy changed since the last push, so it is left alone. */
+  | "cloneChanged"
+  /** Both copies changed since the last push; both are left alone. */
+  | "bothChanged"
+  /** Only the clone has the file. A pull can bring it in. */
+  | "onlyClone"
+  | "missing";
 
 /**
- * Which way a track should be copied during a sync. With a record of the
- * last copy, only the side that changed is copied over the other. When both
- * changed, or there is no record and the files differ, the newer file wins,
- * with the source winning ties since it is the library.
+ * What a push does with a track. A push only ever copies from the source to
+ * the clone, and never over a file the clone changed: with a record of the
+ * last copy, a changed clone copy is left alone and flagged; without one,
+ * the newer file is taken to be the changed one.
  */
-export function decideSync(
+export function decidePush(
   record: SyncRecord | undefined,
   source: FileState | null,
   clone: FileState | null,
-): Decision {
-  if (!source && !clone) return { direction: "missing", bothChanged: false };
-  if (!clone) return { direction: "toClone", bothChanged: false };
-  if (!source) return { direction: "toSource", bothChanged: false };
-
+): PushAction {
+  if (!source) return clone ? "onlyClone" : "missing";
+  if (!clone) return "copy";
   if (record) {
     const sourceChanged = !sameFile(record.source, source);
     const cloneChanged = !sameFile(record.clone, clone);
-    if (!sourceChanged && !cloneChanged) return { direction: "none", bothChanged: false };
-    if (sourceChanged && !cloneChanged) return { direction: "toClone", bothChanged: false };
-    if (!sourceChanged && cloneChanged) return { direction: "toSource", bothChanged: false };
-    return { direction: newer(source, clone), bothChanged: true };
+    if (cloneChanged) return sourceChanged ? "bothChanged" : "cloneChanged";
+    return sourceChanged ? "copy" : "unchanged";
   }
-
-  if (sameFile(source, clone)) return { direction: "none", bothChanged: false };
-  return { direction: newer(source, clone), bothChanged: false };
+  if (sameFile(source, clone)) return "unchanged";
+  return newer(source, clone) === "clone" ? "cloneChanged" : "copy";
 }
 
-function newer(source: FileState, clone: FileState): Direction {
-  if (source.mtime === null || clone.mtime === null) return "toClone";
-  return clone.mtime - source.mtime > MTIME_TOLERANCE_MS ? "toSource" : "toClone";
+export type PullAction =
+  /** The clone's copy goes to the source: the source lacks it, or only the clone changed. */
+  | "copy"
+  | "unchanged"
+  /** Both copies changed since the last push; neither is touched. */
+  | "bothChanged"
+  | "missing";
+
+/**
+ * What a pull does with a track. A pull only ever copies from the clone to
+ * the source, and only files the clone changed: a file changed on both
+ * sides is left for the user to decide.
+ */
+export function decidePull(
+  record: SyncRecord | undefined,
+  source: FileState | null,
+  clone: FileState | null,
+): PullAction {
+  if (!clone) return source ? "unchanged" : "missing";
+  if (!source) return "copy";
+  if (record) {
+    const sourceChanged = !sameFile(record.source, source);
+    const cloneChanged = !sameFile(record.clone, clone);
+    if (!cloneChanged) return "unchanged";
+    return sourceChanged ? "bothChanged" : "copy";
+  }
+  if (sameFile(source, clone)) return "unchanged";
+  return newer(source, clone) === "clone" ? "copy" : "unchanged";
+}
+
+/** Which copy is newer by modification time; the source on ties and unknown times. */
+function newer(source: FileState, clone: FileState): "source" | "clone" {
+  if (source.mtime === null || clone.mtime === null) return "source";
+  return clone.mtime - source.mtime > MTIME_TOLERANCE_MS ? "clone" : "source";
 }
 
 /**

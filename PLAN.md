@@ -8,8 +8,8 @@ A desktop app that copies a Serato library (crates and their tracks) onto other 
 - Small download.
 - Written in TypeScript so it is easy to audit and to build UI for.
 - **Free and open source** (MIT). Other projects are format references only (see References); GPL code is never copied.
-- **One-click sync:** hit "Sync", then open Serato and everything is ready to use. The app never launches, controls or talks to Serato.
-- **v1:** while Serato is running, show a notice and disable Sync until it closes.
+- **One-click push:** hit "Push", then open Serato and the clone is ready to use. "Pull" brings changes made on a clone back into the library, after you confirm the list. The app never launches, controls or talks to Serato.
+- **v1:** while Serato is running, show a notice and disable Push and Pull until it closes.
 
 ## Stack
 
@@ -48,15 +48,16 @@ Applies to `Tracks/` paths and to `Crates/` folder and stub names. Track paths i
 - **Flag names that differ only in case** (`Track.mp3` vs `track.mp3`) as a conflict. They collide on drives that ignore case.
 - **Warn about paths over 260 characters** on Windows targets. Don't shorten them, because shortening would break identity.
 
-## Sync
+## Push and pull
 
-- **Any two locations can sync.** There is no fixed parent and child.
+- **Two one-way actions, no "sync".** Push makes a clone match the library: files it lacks or that changed at the source are copied in, the crates and Serato database are written, nothing is copied back. Pull lists the files a clone changed or added and copies them into the library once the user agrees. Neither ever overwrites a file the other side changed: push leaves a clone-changed file alone and flags it, pull leaves a both-changed file alone and flags it (`src/core/sync.ts`, `src/lib/sync.ts`).
+- **Any two locations can push and pull.** There is no fixed parent and child.
 - **Each location's manifest records the revision it last agreed on with each peer.** Per-track stamps (size, time, revision last changed) say whether a file was edited locally; they replace the per-peer copy records a clone keeps today.
 - **Track identity is the file name** (ignoring case and extension). File names don't change; folders do.
   - A track that isn't where its path says is looked for by name under the root on every scan, and relinked when exactly one file has that name. Several files with the name are narrowed by the old relative place, then extension, then parent folder name; a tie that remains is flagged, as is a name found nowhere (`src/core/relink.ts`).
   - A renamed file is therefore a new track; the old entry is flagged as not found.
-  - Clones do the same on sync: a track whose place in `Tracks/` is empty but whose name sits elsewhere under it is renamed into place, never copied again.
-- **Files:** if only one side changed since the last sync, copy that side's file over the other. If both changed, raise a conflict. Tags are never merged.
+  - Clones do the same on push: a track whose place in `Tracks/` is empty but whose name sits elsewhere under it is renamed into place, never copied again.
+- **Files:** push copies a file only when the source alone changed since the last push; pull copies only when the clone alone changed. A file changed on both sides is left alone on both and flagged. Tags are never merged.
 - **Crates:** merge membership. Tracks added on either side are kept, and tracks removed on either side are removed. A crate renamed or deleted on one side and edited on the other is a conflict.
 - **Selection:** each clone picks individual crates from any collection, and its database lists them. SOURCE always has every crate.
   - A three-state checkbox shows all, some or none of a crate's subtree. A fully checked crate includes its future subcrates. A partly checked crate includes only the subcrates picked.
@@ -66,13 +67,13 @@ Applies to `Tracks/` paths and to `Crates/` folder and stub names. Track paths i
 
 - **Change Source** never deletes or copies anything. It picks a new root, scans it, matches every crate member by file name, and asks before changing anything: how many tracks stay, how many were relinked, how many are ambiguous or not found.
 - Pointing the root one folder up or down, moving the library to another drive, or moving tracks between folders all relink without the user doing anything. Tracks that can't be placed keep their old path and show a dot until the file is put back and the library rescanned, or the track is removed from the crate.
-- Clones follow at their next sync by renaming files into their new places. Serato's own database on the clone keeps stale records for the old paths; cleaning those is still to do, as is removing orphaned files from a clone's `Tracks/`.
+- Clones follow at their next push by renaming files into their new places. Serato's own database on the clone keeps stale records for the old paths; cleaning those is still to do, as is removing orphaned files from a clone's `Tracks/`.
 
 ## Track dots
 
 A track row shows a dot for anything that wants a decision, with a tooltip explaining every issue (`src/core/issues.ts`):
 
-- **Sync conflict** (red): edited on both the source and a clone between syncs; the newer copy won.
+- **Sync conflict** (red): the clone's copy changed since the last push, so push left it alone (pull to bring it in); or both copies changed and both were left alone.
 - **Not found** (red): no file with its name under the root, or several and none could be chosen.
 - **Duplicate** (amber): a different file whose title wholly contains, or is wholly contained in, this one's, on word boundaries. "Super Song" and "Super Song (Remix)" are duplicates; "Super Song Version 1" and "Version 2" are not, and neither are "Song" and "Songbird".
 - **Shared** (blue): the same file in two crates where neither is inside the other. A track in a crate and in its subcrate is scoping, not sharing.
@@ -81,15 +82,15 @@ A track row shows a dot for anything that wants a decision, with a tooltip expla
 
 - **Dropped into `Crates/<crate>/`:** the crate is known but not where to store the file. The app asks for a place in `Tracks/` (suggesting a default), moves the file there and adds it to the crate.
 - **Dropped into `Tracks/`:** where it's stored is known but not which crate. The track goes into an automatic `Incoming` crate and the user is told to assign crates.
-- **Either way:** the Serato crate files are rewritten, and the file goes up to SOURCE at the next sync.
+- **Either way:** the Serato crate files are rewritten, and the file goes up to SOURCE at the next pull.
 - **Scanning:** for v1, scan when the app opens plus a manual "Scan" button. Watching folders comes later.
 
 ## Safety rules
 
 1. Crate changes never delete files from SOURCE. A track removed from every crate stays in SOURCE as unorganized music.
-2. A clone deletes its own copy of a file once the file is in no synced crate.
-3. Deleting a file on a clone does not spread to other locations. If the track is still in a crate, the next sync copies it back.
-4. Generated files (`.m3u` stubs, Serato crates) are rewritten on every sync and are never treated as tracks.
+2. A clone deletes its own copy of a file once the file is in no pushed crate.
+3. Deleting a file on a clone does not spread to other locations. If the track is still in a crate, the next push copies it back.
+4. Generated files (`.m3u` stubs, Serato crates) are rewritten on every push and are never treated as tracks.
 
 ## Steps
 
@@ -101,7 +102,7 @@ A track row shows a dot for anything that wants a decision, with a tooltip expla
    - Verify: the crates appear in Serato with the correct tracks, and the answers are recorded here.
 3. **Clone:** copy SOURCE's crates and their tracks to a target folder, and write `Tracks/`, `Crates/`, the Serato crates and the database.
    - Verify: on a fresh machine, Serato shows the clone's crates playing from the clone's files.
-4. **Sync** between two locations: files, crates and conflicts.
+4. **Push and pull** between two locations: files, crates and conflicts.
    - Verify with tests: one side changed, both sides changed, renames, adds and removes.
 5. **UI:** the Locations and Collections screens (see UI below).
 
@@ -110,10 +111,10 @@ A track row shows a dot for anything that wants a decision, with a tooltip expla
 There is no UI for folders; the OS file browser already handles them. Moving things around in the app is done by dragging. The app has two screens:
 
 - **Locations:** a panel with every location and its status, plus a **New** button for creating a clone.
-  - **Connected** locations (on this computer or a plugged-in drive) can sync.
-  - **Not connected** locations (like another PC) are known only from sync history: "last synced with GIG USB 3 days ago".
+  - **Connected** locations (on this computer or a plugged-in drive) can be pushed to and pulled from.
+  - **Not connected** locations (like another PC) are known only from history: "last pushed to GIG USB 3 days ago".
   - Opening a location lists its **Conflicts**, **Incoming** tracks (not in any crate) and **Missing** tracks (in a crate but missing from SOURCE).
-  - A banner shows while Serato is running, and **Sync** is disabled until Serato closes. Sync syncs every pair of connected locations.
+  - A banner shows while Serato is running, and **Push** and **Pull** are disabled until Serato closes. The toolbar's Push and Pull act on every connected clone, one after another; each clone's card has its own.
 - **Collections:** create and manage collections (top-level crate trees) and their crates, and choose which crates each clone holds. The tree is an always-visible side panel, so tracks can be dragged onto it from any screen.
   - Tracks are added by dragging them from a location's lists, or from Finder or Explorer, onto a crate.
 
@@ -136,11 +137,11 @@ Implemented in `src/core/database.ts`, from databases Serato wrote on Windows. S
 
 - `vrsn`: `2.0/Serato Scratch LIVE Database`.
 - `otrk` per track: `ttyp` file type (`mp3`, `wave`, `aiff`, ...), `pfil` path relative to the volume root, text tags (`tsng`, `tart`, `talb`, `tgen`, `tlen`, `tsiz`, `tbit`, `tsmp`, `tbpm`, `tkey`, `tcom`, `ttyr`), `tadd` and `uadd` date added (Unix seconds, as text and as a number), `ulbl` label colour (`0xFFFFFF` for none), `utme` file modified, `ufsb` file size, `sbav`, then flags `bhrt bmis bply blop bitu bovc bcrt biro bwlb bwll buns bbgl bkrk bstm`.
-- Sync merges: Serato's records and unknown fields are kept byte for byte, and tracks it lacks are appended with the file-system fields only.
+- Push merges: Serato's records and unknown fields are kept byte for byte, and tracks it lacks are appended with the file-system fields only.
 
 ## Later (v2)
 
-- **Tags in `database V2`.** Sync already adds every clone track to the drive's `database V2` (`src/core/database.ts`), but only with what the file system knows: type, path, size and times. Serato reads the tags itself. Writing the tags too would let Serato show retagged files right after a sync, with no "Reload ID3 Tags" rescan, and needs a tag reader (ID3, MP4, FLAC) in TS.
+- **Tags in `database V2`.** Push already adds every clone track to the drive's `database V2` (`src/core/database.ts`), but only with what the file system knows: type, path, size and times. Serato reads the tags itself. Writing the tags too would let Serato show retagged files right after a push, with no "Reload ID3 Tags" rescan, and needs a tag reader (ID3, MP4, FLAC) in TS.
 - Read `database V2` for Serato's view, for example which tracks it marks as missing.
 
 ## Serato behaviour tests (step 2)
@@ -149,7 +150,7 @@ Done by hand in real Serato by the project owner, before any sync code is writte
 
 1. **Crate files alone:** put generated crate files in a fresh `_Serato_` folder on a USB drive. Do the tracks show up and play?
 2. **Serato running:** edit a crate file while Serato is open, then close Serato. Is the edit kept or overwritten? Does Serato need a restart to see changes?
-3. **Retagged files:** change a track's tags and sync it over. Does Serato show the old tags until "Reload ID3 Tags"? If so, v1 tells the user after a sync that updated files.
+3. **Retagged files:** change a track's tags and push it over. Does Serato show the old tags until "Reload ID3 Tags"? If so, v1 tells the user after a push that updated files.
 4. **Special characters:** create crates named with `/`, `:` and `?` in Serato. How are the `.crate` files named? Our generated files must follow the same convention.
 5. **`.m3u` folders:** drag a `Crates/` folder of stubs into Serato. Does it create crates from them?
 

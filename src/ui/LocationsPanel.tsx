@@ -1,11 +1,11 @@
-import { FolderSync, HardDrive, RefreshCw, Usb, X } from "lucide-react";
+import { Download, HardDrive, RefreshCw, Upload, Usb, X } from "lucide-react";
 import { Button } from "@/ui/atoms/button";
 import type { Library } from "@/lib/useLibrary";
-import { describeClone, describeSource, syncTitle } from "@/lib/utils";
+import { cloneActionTitle, describeClone, describeSource } from "@/lib/utils";
 
 /**
  * The source and every clone as cards, each with what it holds and when it
- * was last synced. A clone can be synced on its own or forgotten here.
+ * was last pushed to. A clone can be pushed to, pulled from or forgotten here.
  * Shown under the toolbar while its clones toggle is on.
  */
 export function LocationsPanel({ library }: { library: Library }) {
@@ -45,7 +45,7 @@ export function LocationsPanel({ library }: { library: Library }) {
 
       {clones.map((clone) => {
         const status = cloneStatus[clone.path];
-        const canSync = sourceReady && status?.kind === "ready" && !busy;
+        const canAct = sourceReady && status?.kind === "ready" && !busy;
         const name =
           status?.kind === "ready"
             ? status.result.name
@@ -64,12 +64,22 @@ export function LocationsPanel({ library }: { library: Library }) {
                 <Button
                   variant="outline"
                   size="sm"
-                  title={syncTitle(sourceReady, status)}
-                  disabled={!canSync}
-                  onClick={() => library.syncClone(clone.path)}
+                  title={cloneActionTitle("push", sourceReady, status)}
+                  disabled={!canAct}
+                  onClick={() => library.pushClone(clone.path)}
                 >
-                  <FolderSync />
-                  <span>Sync</span>
+                  <Upload />
+                  <span>Push</span>
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  title={cloneActionTitle("pull", sourceReady, status)}
+                  disabled={!canAct}
+                  onClick={() => library.pullClone(clone.path)}
+                >
+                  <Download />
+                  <span>Pull</span>
                 </Button>
                 <Button
                   variant="ghost"

@@ -1,8 +1,10 @@
 // What a track row's dot stands for: something about the track that wants
 // a decision from the user.
 //
-//   - A sync conflict is a file that was edited on both the source and a
-//     clone between syncs, where the newer copy won and the other edit is gone.
+//   - A sync conflict is a file whose copy on a clone changed since the
+//     last push, so neither push nor pull would overwrite it: push left the
+//     clone's copy alone, and if the library's copy changed too, pull left
+//     that alone as well.
 //   - A not-found track has no file with its name under the library any
 //     more, or several and none could be singled out (see core/relink.ts).
 //   - A duplicate is a different file whose title wholly contains, or is
@@ -23,13 +25,13 @@ export interface TrackIssue {
   detail: string;
 }
 
-/** A file that had changed on both sides when a clone was last synced. */
+/** A file a push or pull left alone because the clone's copy had changed. */
 export interface Conflict {
-  /** The track's source path. */
+  /** The track's tree path. */
   path: string;
-  /** Whose copy was kept, being the newer one. */
-  kept: "source" | "clone";
-  /** When the sync finished, ISO 8601. */
+  /** Whether only the clone's copy changed since the last push, or both copies did. */
+  changed: "clone" | "both";
+  /** When the push or pull finished, ISO 8601. */
   when: string;
 }
 
@@ -196,8 +198,10 @@ export function issuesFor(index: IssueIndex, crateId: string, path: string): Tra
 }
 
 function describeConflict(conflict: Conflict, cloneRoot: string): string {
-  const winner = conflict.kept === "clone" ? "the clone's" : "the library's";
-  return `Edited on both sides before the last sync with ${cloneRoot}. The newer copy, ${winner}, was kept.`;
+  if (conflict.changed === "clone") {
+    return `Changed on the clone at ${cloneRoot} since the last push, so the push left it alone. Pull to bring the clone's copy into the library.`;
+  }
+  return `Changed both in the library and on the clone at ${cloneRoot}. Both copies were left where they are until you decide which to keep.`;
 }
 
 function describeUnresolved(path: string, match: Extract<Match, { kind: "ambiguous" | "notFound" }>): string {

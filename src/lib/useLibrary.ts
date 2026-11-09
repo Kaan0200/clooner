@@ -10,7 +10,7 @@
 // present, progress while folders are being created or a sync is running.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { confirm } from "@tauri-apps/plugin-dialog";
+import { confirm, message as showMessage } from "@tauri-apps/plugin-dialog";
 import { exists } from "@tauri-apps/plugin-fs";
 import { normalizeRoot } from "@/core/clone";
 import { emptyDb, type AppDb, type CloneEntry, type SourceEntry } from "@/core/db";
@@ -29,8 +29,16 @@ import {
   type ScanResult,
 } from "@/lib/library";
 import { loadDb, saveDb } from "@/lib/store";
-import { copyTracks, syncClone as runSync, type CopySummary, type SyncSummary } from "@/lib/sync";
-import { allTrackPaths, describeRelink } from "@/lib/utils";
+import {
+  applyPull,
+  copyTracks,
+  planPull,
+  pushClone as runPush,
+  type CopySummary,
+  type PullSummary,
+  type PushSummary,
+} from "@/lib/sync";
+import { allTrackPaths, describePullPlan, describeRelink } from "@/lib/utils";
 
 /** How the crate members fared against the last scan of the source. */
 export interface RelinkSummary {
@@ -51,8 +59,10 @@ export type SourceStatus =
 export interface ReadyStatus {
   kind: "ready";
   result: CloneResult;
-  /** The last sync (crate files written) in this session. */
-  lastSync?: SyncSummary;
+  /** The last push (crate files written) in this session. */
+  lastPush?: PushSummary;
+  /** The last pull (clone changes brought in) in this session. */
+  lastPull?: PullSummary;
   /** The last copy of dropped tracks in this session. */
   lastCopy?: CopySummary;
 }
@@ -62,7 +72,7 @@ export type CloneStatus =
   | { kind: "waiting" }
   | { kind: "attaching"; progress: string }
   | ReadyStatus
-  /** A copy or a sync is running; `ready` is restored when it finishes. */
+  /** A copy, push or pull is running; `ready` is restored when it finishes. */
   | { kind: "working"; progress: string; ready: ReadyStatus }
   | { kind: "missing" }
   | { kind: "error"; message: string };
@@ -74,7 +84,7 @@ export interface Library {
   warning: string | null;
   /** The last action that failed. */
   error: string | null;
-  /** True while an add or a sync is in progress. */
+  /** True while an add, a push or a pull is in progress. */
   busy: boolean;
   source: SourceEntry | null;
   sourceStatus: SourceStatus | null;
@@ -103,10 +113,20 @@ export interface Library {
   addClone: () => Promise<void>;
   /** Forgets a clone. Nothing on disk is touched. */
   removeClone: (path: string) => void;
-  /** Writes the current crate contents as Serato crate files into the clone. */
-  syncClone: (path: string) => Promise<void>;
-  /** Syncs every clone that is connected right now, one after another. */
-  syncAll: () => Promise<void>;
+  /**
+   * Makes the clone match the library: copies new and changed files in and
+   * writes its crates and Serato database. Nothing is copied back.
+   */
+  pushClone: (path: string) => Promise<void>;
+  /** Pushes to every clone that is connected right now, one after another. */
+  pushAll: () => Promise<void>;
+  /**
+   * Brings files the clone changed or added into the library, after the
+   * user confirms the list. Files changed on both sides are left alone.
+   */
+  pullClone: (path: string) => Promise<void>;
+  /** Pulls from every clone that is connected right now, one after another. */
+  pullAll: () => Promise<void>;
   /**
    * Copies tracks (tree paths) into every connected clone, right away.
    * Resolves to how many clones received them and how many files were
@@ -514,7 +534,7 @@ export function useLibrary(): Library {
     [setClone, update],
   );
 
-  const syncClone = useCallback(
+  const pushClone = useCallback(
     async (path: string) => {
       const current = dbRef.current;
       const status = cloneStatusRef.current[path];
@@ -524,25 +544,25 @@ export function useLibrary(): Library {
       setBusy(true);
       setClone(path, { kind: "working", progress: "Starting…", ready: status });
       try {
-        const lastSync = await runSync(current.library, current.source.path, path, (progress) =>
+        const lastPush = await runPush(current.library, current.source.path, path, (progress) =>
           setClone(path, { kind: "working", progress, ready: status }),
         );
-        setClone(path, { ...status, lastSync });
+        setClone(path, { ...status, lastPush });
         update((d) => ({
           ...d,
           clones: d.clones.map((c) =>
             c.path === path
               ? {
                   ...c,
-                  lastSync: lastSync.finished,
-                  conflicts: lastSync.conflicts.map((k) => ({ ...k, when: lastSync.finished })),
+                  lastSync: lastPush.finished,
+                  conflicts: lastPush.conflicts.map((k) => ({ ...k, when: lastPush.finished })),
                 }
               : c,
           ),
         }));
       } catch (e) {
         setClone(path, status);
-        setError(`Sync failed: ${message(e)}`);
+        setError(`Push failed: ${message(e)}`);
       } finally {
         setBusy(false);
       }
@@ -550,17 +570,74 @@ export function useLibrary(): Library {
     [setClone, update],
   );
 
-  const syncAll = useCallback(async () => {
+  const pullClone = useCallback(
+    async (path: string) => {
+      const current = dbRef.current;
+      const status = cloneStatusRef.current[path];
+      if (!current?.source || !current.library || status?.kind !== "ready") return;
+
+      setError(null);
+      setBusy(true);
+      setClone(path, { kind: "working", progress: "Comparing…", ready: status });
+      try {
+        const plan = await planPull(current.library, current.source.path, path, (progress) =>
+          setClone(path, { kind: "working", progress, ready: status }),
+        );
+        const name = status.result.name || path;
+        setClone(path, status);
+        if (plan.copy.length === 0 && plan.bothChanged.length === 0) {
+          await showMessage(`Nothing to bring in from "${name}": every file matches the library.`, {
+            title: "Pull",
+            kind: "info",
+          });
+          return;
+        }
+        if (plan.copy.length === 0) {
+          // Only files changed on both sides: nothing to do but say so.
+          await showMessage(describePullPlan(plan, name), { title: "Pull", kind: "warning" });
+          return;
+        }
+        const ok = await confirm(describePullPlan(plan, name), {
+          title: "Pull",
+          kind: plan.bothChanged.length > 0 ? "warning" : "info",
+          okLabel: `Bring in ${plan.copy.length.toLocaleString()}`,
+          cancelLabel: "Not now",
+        });
+        if (!ok) return;
+        setClone(path, { kind: "working", progress: "Bringing in…", ready: status });
+        const lastPull = await applyPull(path, plan, (progress) =>
+          setClone(path, { kind: "working", progress, ready: status }),
+        );
+        setClone(path, { ...status, lastPull });
+        update((d) => ({
+          ...d,
+          clones: d.clones.map((c) =>
+            c.path === path
+              ? { ...c, conflicts: lastPull.conflicts.map((k) => ({ ...k, when: lastPull.finished })) }
+              : c,
+          ),
+        }));
+      } catch (e) {
+        setClone(path, status);
+        setError(`Pull failed: ${message(e)}`);
+      } finally {
+        setBusy(false);
+      }
+    },
+    [setClone, update],
+  );
+
+  /** One clone at a time: two jobs at once would only fight over the disk. */
+  const forEachConnected = useCallback(async (job: (path: string) => Promise<void>) => {
     const current = dbRef.current;
     if (!current?.source) return;
-    // One at a time: each sync reads the source and writes the clone, and
-    // two running at once would only fight over the disk.
     for (const clone of current.clones) {
-      if (cloneStatusRef.current[clone.path]?.kind === "ready") {
-        await syncClone(clone.path);
-      }
+      if (cloneStatusRef.current[clone.path]?.kind === "ready") await job(clone.path);
     }
-  }, [syncClone]);
+  }, []);
+
+  const pushAll = useCallback(() => forEachConnected(pushClone), [forEachConnected, pushClone]);
+  const pullAll = useCallback(() => forEachConnected(pullClone), [forEachConnected, pullClone]);
 
   const copyToClones = useCallback(
     async (paths: string[]) => {
@@ -637,8 +714,10 @@ export function useLibrary(): Library {
     changeSource,
     addClone,
     removeClone,
-    syncClone,
-    syncAll,
+    pushClone,
+    pushAll,
+    pullClone,
+    pullAll,
     copyToClones,
     rescan,
   };

@@ -1,8 +1,8 @@
 [package]
 name = "clooner"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "Copies a Serato library onto other drives and computers and keeps every copy in step."
+authors = ["A. Kaan Atesoglu"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

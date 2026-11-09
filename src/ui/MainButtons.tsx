@@ -1,9 +1,9 @@
 import { useState } from "react";
-import { FolderSync, HardDrive, Plus, Usb } from "lucide-react";
+import { Download, HardDrive, Plus, Upload, Usb } from "lucide-react";
 import { Button } from "@/ui/atoms/button";
 import type { CrateNode } from "@/core/tree";
 import type { Library } from "@/lib/useLibrary";
-import { baseName, cn, plural } from "@/lib/utils";
+import { PULL_HINT, PUSH_HINT, baseName, cn, plural } from "@/lib/utils";
 import { LocationsPanel } from "./LocationsPanel";
 
 interface MainButtonsProps {
@@ -22,8 +22,8 @@ const TOOL_BUTTON =
 
 /**
  * The toolbar above the crate tree. The top row holds the actions: add a
- * crate, pick or change the source, sync every clone, add a clone, and a
- * toggle that shows the clones with their status. The row below explains
+ * crate, pick or change the source, push to and pull from every connected
+ * clone, add a clone, and a toggle that shows the clones with their status. The row below explains
  * whichever button the pointer is over, otherwise names the selected row,
  * and reports progress and problems.
  */
@@ -61,17 +61,21 @@ export function MainButtons({
     ? "Click to point at a different folder: tracks are found again by file name, and nothing is deleted."
     : "Choose the root folder of your music library.";
 
-  const syncHint = !source
-    ? "Add a source before syncing."
-    : !sourceReady
-      ? "The source must be connected to sync."
-      : clones.length === 0
-        ? "Add a clone before syncing."
-        : connected === 0
-          ? "No clone is connected right now."
-          : busy
-            ? "Busy: wait for the current job to finish."
-            : `Scan and update ${plural(connected, "connected clone")}: copy newer files both ways, then write the crates and Serato database.`;
+  // Push and pull share the reasons they can't run; only the action differs.
+  const blocker = (verb: string) =>
+    !source
+      ? `Add a source before you ${verb}.`
+      : !sourceReady
+        ? `The source must be connected to ${verb}.`
+        : clones.length === 0
+          ? `Add a clone before you ${verb}.`
+          : connected === 0
+            ? "No clone is connected right now."
+            : busy
+              ? "Busy: wait for the current job to finish."
+              : null;
+  const pushHint = blocker("push") ?? `Update ${plural(connected, "connected clone")}. ${PUSH_HINT}`;
+  const pullHint = blocker("pull") ?? `Check ${plural(connected, "connected clone")}. ${PULL_HINT}`;
 
   const addCloneHint = sourceReady
     ? "Choose a folder, such as a USB drive, to keep as a clone of the source."
@@ -122,16 +126,29 @@ export function MainButtons({
           </Button>
         </HintTarget>
 
-        <HintTarget hint={syncHint} onHint={setHint}>
+        <HintTarget hint={pushHint} onHint={setHint}>
           <Button
             variant="outline"
             size="lg"
             className={TOOL_BUTTON}
-            onClick={library.syncAll}
+            onClick={library.pushAll}
             disabled={busy || !sourceReady || connected === 0}
           >
-            <FolderSync />
-            <span>Sync</span>
+            <Upload />
+            <span>Push</span>
+          </Button>
+        </HintTarget>
+
+        <HintTarget hint={pullHint} onHint={setHint}>
+          <Button
+            variant="outline"
+            size="lg"
+            className={TOOL_BUTTON}
+            onClick={library.pullAll}
+            disabled={busy || !sourceReady || connected === 0}
+          >
+            <Download />
+            <span>Pull</span>
           </Button>
         </HintTarget>
 

@@ -71,14 +71,14 @@ describe("duplicate tracks", () => {
 describe("track issues", () => {
   it("lists sync conflicts before duplicates", () => {
     const issues = trackIssues(tree, [
-      { path: "E:/", conflicts: [{ path: "C:\\Music\\song.mp3", kept: "clone", when: "2026-10-13T00:00:00Z" }] },
-      { path: "F:/", conflicts: [{ path: "C:/Music/b.mp3", kept: "source", when: "2026-10-13T00:00:00Z" }] },
+      { path: "E:/", conflicts: [{ path: "C:\\Music\\song.mp3", changed: "clone", when: "2026-10-13T00:00:00Z" }] },
+      { path: "F:/", conflicts: [{ path: "C:/Music/b.mp3", changed: "both", when: "2026-10-13T00:00:00Z" }] },
     ]).byTrack;
     expect(issues.get("c:/music/song.mp3")?.map((i) => i.kind)).toEqual(["sync", "duplicate"]);
     expect(issues.get("c:/music/song.mp3")?.[0].detail).toContain("E:/");
-    expect(issues.get("c:/music/song.mp3")?.[0].detail).toContain("the clone's");
+    expect(issues.get("c:/music/song.mp3")?.[0].detail).toContain("Pull to bring");
     expect(issues.get("c:/music/b.mp3")?.map((i) => i.kind)).toEqual(["sync"]);
-    expect(issues.get("c:/music/b.mp3")?.[0].detail).toContain("the library's");
+    expect(issues.get("c:/music/b.mp3")?.[0].detail).toContain("both in the library and on the clone");
     expect(issues.has("c:/music/a.mp3")).toBe(false);
   });
 
@@ -95,7 +95,7 @@ describe("track issues", () => {
     ]);
     const issues = trackIssues(
       tree,
-      [{ path: "E:/", conflicts: [{ path: "C:/Music/b.mp3", kept: "source", when: "2026-10-13T00:00:00Z" }] }],
+      [{ path: "E:/", conflicts: [{ path: "C:/Music/b.mp3", changed: "clone", when: "2026-10-13T00:00:00Z" }] }],
       unresolved,
     ).byTrack;
     expect(issues.get("c:/music/b.mp3")?.map((i) => i.kind)).toEqual(["sync", "notFound"]);

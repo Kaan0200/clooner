@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
-  decideSync,
+  decidePull,
+  decidePush,
   needsCopy,
   planCrates,
   planTracks,
@@ -109,40 +110,58 @@ describe("sameFile", () => {
   });
 });
 
-describe("decideSync", () => {
+describe("decidePush", () => {
   const later = { size: 12, mtime: 500_000 };
   const other = { size: 13, mtime: 300_000 };
 
-  it("fills in whichever side is missing", () => {
-    expect(decideSync(record, state, null).direction).toBe("toClone");
-    expect(decideSync(record, null, state).direction).toBe("toSource");
-    expect(decideSync(undefined, null, null).direction).toBe("missing");
+  it("copies what the clone lacks and never copies back", () => {
+    expect(decidePush(record, state, null)).toBe("copy");
+    expect(decidePush(record, null, state)).toBe("onlyClone");
+    expect(decidePush(undefined, null, null)).toBe("missing");
   });
 
-  it("with a record, copies only the side that changed", () => {
-    expect(decideSync(record, state, state)).toEqual({ direction: "none", bothChanged: false });
-    expect(decideSync(record, later, state)).toEqual({ direction: "toClone", bothChanged: false });
-    expect(decideSync(record, state, later)).toEqual({ direction: "toSource", bothChanged: false });
+  it("with a record, copies only when the source alone changed", () => {
+    expect(decidePush(record, state, state)).toBe("unchanged");
+    expect(decidePush(record, later, state)).toBe("copy");
+    expect(decidePush(record, state, later)).toBe("cloneChanged");
+    expect(decidePush(record, other, later)).toBe("bothChanged");
+    expect(decidePush(record, later, other)).toBe("bothChanged");
   });
 
-  it("when both changed, the newer file wins and the clash is flagged", () => {
-    expect(decideSync(record, other, later)).toEqual({ direction: "toSource", bothChanged: true });
-    expect(decideSync(record, later, other)).toEqual({ direction: "toClone", bothChanged: true });
-  });
-
-  it("without a record, identical files stay put and otherwise the newer wins", () => {
-    expect(decideSync(undefined, state, { ...state }).direction).toBe("none");
-    expect(decideSync(undefined, state, later).direction).toBe("toSource");
-    expect(decideSync(undefined, later, state).direction).toBe("toClone");
+  it("without a record, takes the newer file to be the changed one", () => {
+    expect(decidePush(undefined, state, { ...state })).toBe("unchanged");
+    expect(decidePush(undefined, later, state)).toBe("copy");
+    expect(decidePush(undefined, state, later)).toBe("cloneChanged");
   });
 
   it("lets the source win ties and unknown timestamps", () => {
-    expect(decideSync(undefined, { size: 1, mtime: 100_000 }, { size: 2, mtime: 101_000 }).direction).toBe(
-      "toClone",
-    );
-    expect(decideSync(undefined, { size: 1, mtime: null }, { size: 2, mtime: 9 }).direction).toBe(
-      "toClone",
-    );
+    expect(decidePush(undefined, { size: 1, mtime: 100_000 }, { size: 2, mtime: 101_000 })).toBe("copy");
+    expect(decidePush(undefined, { size: 1, mtime: null }, { size: 2, mtime: 9 })).toBe("copy");
+  });
+});
+
+describe("decidePull", () => {
+  const later = { size: 12, mtime: 500_000 };
+  const other = { size: 13, mtime: 300_000 };
+
+  it("brings in what the source lacks and nothing the clone lacks", () => {
+    expect(decidePull(record, null, state)).toBe("copy");
+    expect(decidePull(record, state, null)).toBe("unchanged");
+    expect(decidePull(undefined, null, null)).toBe("missing");
+  });
+
+  it("with a record, copies only when the clone alone changed", () => {
+    expect(decidePull(record, state, state)).toBe("unchanged");
+    expect(decidePull(record, state, later)).toBe("copy");
+    expect(decidePull(record, later, state)).toBe("unchanged");
+    expect(decidePull(record, other, later)).toBe("bothChanged");
+  });
+
+  it("without a record, brings in only a clearly newer clone file", () => {
+    expect(decidePull(undefined, state, { ...state })).toBe("unchanged");
+    expect(decidePull(undefined, state, later)).toBe("copy");
+    expect(decidePull(undefined, later, state)).toBe("unchanged");
+    expect(decidePull(undefined, { size: 1, mtime: 100_000 }, { size: 2, mtime: 101_000 })).toBe("unchanged");
   });
 });
 

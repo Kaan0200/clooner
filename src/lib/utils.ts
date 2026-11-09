@@ -13,7 +13,7 @@ import {
 } from "@/core/tree";
 import type { RelinkPlan } from "@/core/relink";
 import type { CloneResult } from "@/lib/library";
-import type { CopySummary, SyncSummary } from "@/lib/sync";
+import type { CopySummary, PullPlan, PullSummary, PushSummary } from "@/lib/sync";
 import type { CloneStatus, RelinkSummary, SourceStatus } from "@/lib/useLibrary";
 
 export { cn } from "cn";
@@ -141,14 +141,21 @@ export function crateAt(position: PhysicalPosition): string | null {
 
 // --- Locations -------------------------------------------------------------
 
-export function syncTitle(
+export const PUSH_HINT =
+  "Copy new and changed files from the library to the clone, then write its crates and Serato database. Nothing is copied back.";
+export const PULL_HINT =
+  "Bring files edited or added on the clone into the library. You confirm the list first.";
+
+/** Why a clone's Push or Pull button is enabled or not. */
+export function cloneActionTitle(
+  action: "push" | "pull",
   sourceReady: boolean,
   status: CloneStatus | undefined,
 ): string {
-  if (!sourceReady) return "The source must be connected to sync";
+  if (!sourceReady) return `The source must be connected to ${action}`;
   switch (status?.kind) {
     case "ready":
-      return "Copy newer files both ways, then write the crates and database into the drive's _Serato_ folder";
+      return action === "push" ? PUSH_HINT : PULL_HINT;
     case "working":
       return "Busy";
     case "missing":
@@ -156,6 +163,26 @@ export function syncTitle(
     default:
       return "The clone isn't ready yet";
   }
+}
+
+/** The question asked before a pull: what will be copied in, and what is left alone. */
+export function describePullPlan(plan: PullPlan, cloneName: string): string {
+  const lines: string[] = [];
+  if (plan.copy.length > 0) {
+    const what = plan.copy.length === 1 ? "this file" : `these ${plural(plan.copy.length, "file")}`;
+    lines.push(`Bring ${what} from "${cloneName}" into the library? The library's copies are replaced.`, "");
+    lines.push(...plan.copy.slice(0, 12).map((t) => t.relative));
+    if (plan.copy.length > 12) lines.push(`…and ${plan.copy.length - 12} more`);
+  }
+  if (plan.bothChanged.length > 0) {
+    if (lines.length > 0) lines.push("");
+    lines.push(
+      `${plural(plan.bothChanged.length, "file")} changed both in the library and on the clone and will be left alone until you decide which to keep:`,
+    );
+    lines.push(...plan.bothChanged.slice(0, 6).map((t) => t.relative));
+    if (plan.bothChanged.length > 6) lines.push(`…and ${plan.bothChanged.length - 6} more`);
+  }
+  return lines.join("\n");
 }
 
 export function describeSource(status: SourceStatus | null): string {
@@ -206,10 +233,15 @@ export function describeClone(
   status: CloneStatus | undefined,
 ): string {
   switch (status?.kind) {
-    case "ready":
-      if (status.lastSync) return describeSync(status.lastSync);
-      if (status.lastCopy) return describeCopy(status.lastCopy);
-      return describeAttached(clone, status.result);
+    case "ready": {
+      // The most recent thing that happened to the clone this session.
+      const events: Array<[string, () => string]> = [];
+      if (status.lastPush) events.push([status.lastPush.finished, () => describePush(status.lastPush!)]);
+      if (status.lastPull) events.push([status.lastPull.finished, () => describePull(status.lastPull!)]);
+      if (status.lastCopy) events.push([status.lastCopy.finished, () => describeCopy(status.lastCopy!)]);
+      events.sort((a, b) => b[0].localeCompare(a[0]));
+      return events.length > 0 ? events[0][1]() : describeAttached(clone, status.result);
+    }
     case "working":
     case "attaching":
       return status.progress;
@@ -231,12 +263,12 @@ function describeAttached(
   const trackText =
     tracks === 0 ? "no tracks" : `${tracks.toLocaleString()} tracks`;
   const when = clone.lastSync
-    ? `last synced ${relativeTime(clone.lastSync)}`
-    : "never synced";
+    ? `last pushed ${relativeTime(clone.lastSync)}`
+    : "never pushed";
   return `${trackText} in ${folderText}, ${when}`;
 }
 
-function describeSync(s: SyncSummary): string {
+function describePush(s: PushSummary): string {
   const parts = [`${s.crates.toLocaleString()} crates written`];
   if (s.databaseAdded)
     parts.push(
@@ -245,18 +277,25 @@ function describeSync(s: SyncSummary): string {
   if (s.databaseError)
     parts.push(`Serato database left alone (${s.databaseError})`);
   if (s.relinked) parts.push(`${s.relinked.toLocaleString()} moved into place`);
-  if (s.toClone) parts.push(`${s.toClone.toLocaleString()} copied to clone`);
-  if (s.toSource)
-    parts.push(`${s.toSource.toLocaleString()} copied back to source`);
+  if (s.copied) parts.push(`${s.copied.toLocaleString()} copied to clone`);
   if (s.unchanged) parts.push(`${s.unchanged.toLocaleString()} unchanged`);
+  if (s.cloneChanged)
+    parts.push(`${s.cloneChanged.toLocaleString()} changed on the clone, left alone (pull to bring in)`);
   if (s.bothChanged)
-    parts.push(
-      `${s.bothChanged.toLocaleString()} changed on both sides, newer kept`,
-    );
+    parts.push(`${s.bothChanged.toLocaleString()} changed on both sides, left alone`);
+  if (s.onlyClone)
+    parts.push(`${s.onlyClone.toLocaleString()} only on the clone (pull to bring in)`);
   if (s.missing) parts.push(`${s.missing.toLocaleString()} missing everywhere`);
   if (s.outside)
     parts.push(`${s.outside.toLocaleString()} outside the library left out`);
-  return `Synced ${relativeTime(s.finished)}: ${parts.join(", ")}`;
+  return `Pushed ${relativeTime(s.finished)}: ${parts.join(", ")}`;
+}
+
+function describePull(s: PullSummary): string {
+  const parts = [`${s.copied.toLocaleString()} brought into the library`];
+  if (s.bothChanged)
+    parts.push(`${s.bothChanged.toLocaleString()} changed on both sides, left alone`);
+  return `Pulled ${relativeTime(s.finished)}: ${parts.join(", ")}`;
 }
 
 function describeCopy(s: CopySummary): string {
@@ -266,5 +305,5 @@ function describeCopy(s: CopySummary): string {
     parts.push(`${s.missing.toLocaleString()} missing from source`);
   if (s.outside)
     parts.push(`${s.outside.toLocaleString()} outside the library`);
-  return `Tracks ${relativeTime(s.finished)}: ${parts.join(", ")}. Press Sync to write the crates.`;
+  return `Tracks ${relativeTime(s.finished)}: ${parts.join(", ")}. Press Push to write the crates.`;
 }

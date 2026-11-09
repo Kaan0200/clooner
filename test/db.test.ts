@@ -11,7 +11,7 @@ const full: AppDb = {
       id: "abc",
       added: "2026-10-13T01:00:00.000Z",
       lastSync: "2026-10-13T02:00:00.000Z",
-      conflicts: [{ path: "a.mp3", kept: "clone", when: "2026-10-13T02:00:00.000Z" }],
+      conflicts: [{ path: "a.mp3", changed: "both", when: "2026-10-13T02:00:00.000Z" }],
     },
   ],
   library: {
@@ -76,10 +76,10 @@ describe("app database", () => {
     const db = parseDb(
       JSON.stringify({
         version: 2,
-        clones: [{ path: "E:/", conflicts: [{ path: "a.mp3", kept: "bogus" }, { kept: "clone" }, "x"] }],
+        clones: [{ path: "E:/", conflicts: [{ path: "a.mp3", changed: "bogus" }, { changed: "both" }, "x"] }],
       }),
     );
-    expect(db.clones[0].conflicts).toEqual([{ path: "a.mp3", kept: "source", when: new Date(0).toISOString() }]);
+    expect(db.clones[0].conflicts).toEqual([{ path: "a.mp3", changed: "clone", when: new Date(0).toISOString() }]);
   });
 
   describe("upgrading a version 1 database", () => {
@@ -92,7 +92,7 @@ describe("app database", () => {
           id: "abc",
           added: "2026-10-13T01:00:00.000Z",
           lastSync: null,
-          conflicts: [{ path: "C:/Music/Club/a.mp3", kept: "clone", when: "2026-10-13T02:00:00.000Z" }],
+          conflicts: [{ path: "C:/Music/Club/a.mp3", changed: "clone", when: "2026-10-13T02:00:00.000Z" }],
         },
       ],
       crates: [

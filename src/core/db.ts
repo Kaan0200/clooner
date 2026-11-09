@@ -28,9 +28,9 @@ export interface CloneEntry {
   id: string | null;
   /** When it was added, ISO 8601. */
   added: string;
-  /** When it was last synced from the source, ISO 8601, or null if never. */
+  /** When it was last pushed to from the source, ISO 8601, or null if never. */
   lastSync: string | null;
-  /** Files changed on both sides at the last sync, kept until the next one. */
+  /** Files the last push or pull left alone because the clone's copy had changed. */
   conflicts: Conflict[];
 }
 
@@ -166,7 +166,7 @@ function parseConflict(value: unknown): Conflict | null {
   if (!isRecord(value) || typeof value.path !== "string" || value.path === "") return null;
   return {
     path: value.path,
-    kept: value.kept === "clone" ? "clone" : "source",
+    changed: value.changed === "both" ? "both" : "clone",
     when: isoOr(value.when),
   };
 }
